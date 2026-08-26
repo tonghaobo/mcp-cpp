@@ -1,0 +1,18 @@
+# Build outputs
+build/
+build_*/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+
+# Python (interop tests)
+.venv/
+__pycache__/
+*.pyc
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
