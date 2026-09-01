@@ -41,9 +41,10 @@ def request(port, body, headers=None):
 
 def main() -> int:
     binary = sys.argv[1] if len(sys.argv) > 1 else "./build/mcp_http_example"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 8946
+    host = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+    port = int(sys.argv[3]) if len(sys.argv) > 3 else 8946
 
-    proc = subprocess.Popen([binary, str(port)],
+    proc = subprocess.Popen([binary, host, str(port)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True)
     try:
@@ -75,7 +76,7 @@ def main() -> int:
         assert status == 200, (status, raw)
         r = json.loads(raw)["result"]
         names = {t["name"] for t in r["tools"]}
-        assert names == {"echo", "add", "get_time"}, names
+        assert names == {"echo", "add", "slow_add", "get_time"}, names
         assert r["cacheScope"] in ("private", "public"), r
         assert r["resultType"] == "complete", r
         assert r["ttlMs"] == 0, r

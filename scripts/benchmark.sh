@@ -20,7 +20,7 @@ docker run --rm -e CONCS="$CONCS" -e REQUESTS="$REQUESTS" -v "$PWD:/src" -w /src
   cmake --build build -j"$(nproc)" --target mcp_http_example >/dev/null
 
   echo "### 2. mcp-cpp (C++/workflow)"
-  ./build/mcp_http_example 8980 >/tmp/mcppp.log 2>&1 &
+  ./build/mcp_http_example 127.0.0.1 8980 >/tmp/mcppp.log 2>&1 &
   MC=$!
   sleep 1.5
   for C in $CONCS; do

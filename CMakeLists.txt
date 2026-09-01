@@ -2,12 +2,12 @@ cmake_minimum_required(VERSION 3.24)
 project(mcp-cpp VERSION 0.1.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
-# mcp-cpp: a high-performance MCP Server framework in C++17.
+# mcp-cpp: a high-performance MCP Server framework in C++20.
 # JSON-RPC 2.0 protocol layer + stdio + Streamable HTTP transports on
 # sogou/workflow (tools/list, tools/call), v1/v2 dual protocol forms.
 # ---------------------------------------------------------------------------
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 

@@ -42,6 +42,11 @@ class McpServer {
   // All registered tools, in registration order.
   const std::vector<Tool>& tools() const { return tools_; }
 
+  // True if the named tool is registered with async execution enabled. Used by
+  // the HTTP transport to decide whether a tool/call may be dispatched to a
+  // compute thread instead of the transport thread.
+  bool is_tool_async(const std::string& name) const;
+
   // Handle one decoded JSON-RPC message (a request or notification object, as
   // produced by the transport layer). Returns the JSON to reply with, or a
   // null json when nothing should be sent back. Never throws.

@@ -7,7 +7,7 @@
 // Run with: ./mcp_example   (speaks newline-delimited JSON-RPC on stdin/stdout)
 //
 // get_time uses gmtime_r(), a POSIX function; expose it even under strict
-// -std=c++17 (glibc hides POSIX declarations unless a feature macro is set).
+// -std=c++20 (glibc hides POSIX declarations unless a feature macro is set).
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -55,13 +55,15 @@ json get_time_handler(const json& /*args*/) {
 int main() {
   mcp::McpServer server;
   server.add_tool(mcp::Tool{
-      "echo", "Echoes back the provided text.", json::object(), echo_handler});
+      .name = "echo", .description = "Echoes back the provided text.",
+      .input_schema = json::object(), .handler = echo_handler});
   server.add_tool(mcp::Tool{
-      "add", "Adds two numbers and returns their sum.", json::object(),
-      add_handler});
+      .name = "add", .description = "Adds two numbers and returns their sum.",
+      .input_schema = json::object(), .handler = add_handler});
   server.add_tool(mcp::Tool{
-      "get_time", "Returns the current UTC time in ISO-8601 format.",
-      json::object(), get_time_handler});
+      .name = "get_time",
+      .description = "Returns the current UTC time in ISO-8601 format.",
+      .input_schema = json::object(), .handler = get_time_handler});
 
   mcp::StdioTransport transport;
   transport.set_message_handler([&server](const json& message) {

@@ -1,8 +1,8 @@
 # mcp-cpp
 
-> A high-performance [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server framework implemented in C++17 from scratch. Engineered for high-concurrency tool calls — with benchmark data against the official Python SDK — while the mainstream ecosystem trades performance for features. Clean layered architecture (JSON-RPC → transport → server), transport-agnostic core, and a thread-pool extension point.
+> A high-performance [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server framework implemented in C++20 from scratch. Engineered for high-concurrency tool calls — with benchmark data against the official Python SDK — while the mainstream ecosystem trades performance for features. Clean layered architecture (JSON-RPC → transport → server), transport-agnostic core, and a thread-pool extension point.
 
-用 C++17 从零实现的高性能 MCP（Model Context Protocol）Server 框架。
+用 C++20 从零实现的高性能 MCP（Model Context Protocol）Server 框架。
 
 针对 MCP 生态主流实现"功能优先、性能随缘"的现状，本框架把重点放在**高并发工具调用**的延迟与吞吐上，并附 benchmark 数据证明。当前支持两种传输、双协议形态：
 - **stdio**（`StdioTransport`）：最小闭环，JSON-RPC 2.0 协议层 + `initialize` / `tools/list` / `tools/call`。
@@ -14,7 +14,7 @@
 
 ### 本机编译
 
-本项目是标准 CMake 工程，任何装有 CMake ≥ 3.24 与 C++17 编译器的环境都可直接编译，**无需 Docker**。构建时自动通过 FetchContent 拉取 `nlohmann/json`；若开启 HTTP 传输还需 `sogou/workflow`（其依赖 OpenSSL 开发头）。
+本项目是标准 CMake 工程，任何装有 CMake ≥ 3.24 与 C++20 编译器的环境都可直接编译，**无需 Docker**。构建时自动通过 FetchContent 拉取 `nlohmann/json`；若开启 HTTP 传输还需 `sogou/workflow`（其依赖 OpenSSL 开发头）。
 
 **依赖安装**（仅构建，按需选择平台）：
 
@@ -39,8 +39,11 @@ ctest --test-dir build --output-on-failure
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMCP_ENABLE_WORKFLOW=ON
 cmake --build build -j"$(nproc)"
-./build/mcp_http_example 8931        # 监听 http://127.0.0.1:8931/mcp
+./build/mcp_http_example 127.0.0.1 8931   # 默认 http://127.0.0.1:8931/mcp
+./build/mcp_http_example 0.0.0.0 8931     # 绑定所有接口，接受远程连接
 ```
+
+> `mcp_http_example` 接受 `[host] [port]`：`host` 为监听地址（`127.0.0.1` 仅本机、`0.0.0.0` 对外），默认 `127.0.0.1`；`port` 默认 `8931`。
 
 产物：静态库 `libmcp.a`、示例 server `build/mcp_example`（stdio）/ `build/mcp_http_example`（HTTP）、单元测试 `jsonrpc_test` / `server_test`。
 
@@ -152,7 +155,7 @@ int main() {
 - **协议层** `include/mcp/jsonrpc.hpp` + `src/jsonrpc.cpp`：JSON-RPC 2.0 消息编解码。`parse(raw)` 永不抛异常：非法 JSON → `-32700`；非对象 / 缺 method 且非 response → `-32600`（能识别 id 时回显）；有 method+id → Request；有 method 无 id → Notification；有 id+result/error → Response。
 - **传输层**：
   - `StdioTransport`（`transport_stdio.cpp`）：按行读 stdin → `jsonrpc::parse` → 调 handler → 写 stdout 并 flush；忽略 SIGPIPE；EOF 优雅退出。
-  - `StreamableHttpTransport`（`transport_http.cpp`，需 `MCP_ENABLE_WORKFLOW=ON`）：基于 sogou/workflow，单端点 `/mcp` POST/GET/DELETE；多客户端异步，JSON-RPC 分发复用 `handle_message`。同一端点**自动分流 v1/v2**：v1（`Mcp-Session-Id` 会话）+ v2（`2026-07-28` stateless，无 session / `server/discover`）。
+  - `StreamableHttpTransport`（`transport_http.cpp`，需 `MCP_ENABLE_WORKFLOW=ON`）：基于 sogou/workflow，单端点 `/mcp` POST/GET/DELETE；多客户端异步，JSON-RPC 分发复用 `handle_message`。同一端点**自动分流 v1/v2**：v1（`Mcp-Session-Id` 会话）+ v2（`2026-07-28` stateless，无 session / `server/discover`）。监听地址可配（`run(host, port)`，默认 `127.0.0.1`；传 `0.0.0.0` 对外暴露）。支持**异步 tool handler**：将某 tool 标记为 `async` 并注册 async probe 后，其 `tools/call` 被派发到 workflow compute 线程（go task）执行，transport 线程不被慢 handler 阻塞。
 - **服务端核心** `include/mcp/server.hpp` + `src/server.cpp`：工具注册 + 分发。`initialize`（回 `protocolVersion`/`capabilities`/`serverInfo`）、`ping`、`tools/list`、`tools/call`、`notifications/initialized`；未知方法 `-32601`；工具缺失/参数非法 `-32602`；工具不存在 `-32005`；handler 抛 `std::invalid_argument` → `-32602`，其他异常 → `-32603`。handler 返回值若已是含 `content` 的对象则透传，否则包装为 `{content:[{type:"text",text}], isError:false}`。
 
 ## 协议版本
@@ -171,7 +174,7 @@ int main() {
 | `tests/server_test.cpp` | 单元 | 握手字段、`-32601/-32602/-32005/-32603`、ping、list、通知、透传 |
 | `tests/stdio_integration.py` | 集成（无 SDK 依赖） | spawn `mcp_example` 走 11 步原始 JSON-RPC：握手→通知→ping→list→call echo/add→未知工具→未知方法→坏参数→坏 JSON→EOF 退出码 0 |
 | `tests/interop_stdio.py` | 互通 | 官方 Python SDK `ClientSession` stdio 连接 + `initialize` / `list_tools` / `call_tool` |
-| `tests/http_integration.py` | 集成（无 SDK 依赖） | spawn `mcp_http_example` 走 10 步原始 HTTP（v1）：握手+会话、无会话 400、list/call、错误分支、202 通知、DELETE、GET SSE |
+| `tests/http_integration.py` | 集成（无 SDK 依赖） | spawn `mcp_http_example` 走 11 步原始 HTTP（v1）：握手+会话、无会话 400、list/call（含异步 tool `slow_add`）、错误分支、202 通知、DELETE、GET SSE |
 | `tests/interop_http.py` | 互通 | 官方 SDK `streamable_http_client`（v1） + `initialize` / `list_tools` / `call_tool` |
 | `tests/http_integration_v2.py` | 集成（无 SDK 依赖，v2） | spawn `mcp_http_example` 走 5 步原始 HTTP stateless：server/discover、无 session 的 list/call/ping、错误分支 |
 | `tests/interop_http_v2.py` | 互通（v2） | 官方 SDK `Client`（auto + pinned `2026-07-28`）+ `list_tools` / `call_tool` |
@@ -197,7 +200,7 @@ v1 形态并发 `tools/call` `add`（相同工具、同容器、同压测客户�
 
 ```
 .
-├── CMakeLists.txt              # C++17；mcp 静态库 + mcp_example + mcp_http_example + ctest；MCP_ENABLE_WORKFLOW 开关
+├── CMakeLists.txt              # C++20；mcp 静态库 + mcp_example + mcp_http_example + ctest；MCP_ENABLE_WORKFLOW 开关
 ├── Dockerfile                  # ubuntu:24.04 + build-essential/cmake/git/libssl-dev/python3-venv
 ├── include/mcp/                # 公共头文件（jsonrpc / protocol / tool / transport / transport_stdio / transport_http / server）
 ├── src/                        # 实现（jsonrpc / server / tool / transport_stdio / transport_http）

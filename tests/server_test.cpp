@@ -47,12 +47,18 @@ json boom_handler(const json& /*args*/) {
 
 mcp::McpServer make_server() {
   mcp::McpServer server;
-  server.add_tool(mcp::Tool{"echo", "Echoes text back.", json::object(),
-                            echo_handler});
-  server.add_tool(mcp::Tool{"add", "Adds two numbers.", json::object(),
-                            add_handler});
-  server.add_tool(mcp::Tool{"boom", "Always throws.", json::object(),
-                            boom_handler});
+  server.add_tool(mcp::Tool{.name = "echo",
+                            .description = "Echoes text back.",
+                            .input_schema = json::object(),
+                            .handler = echo_handler});
+  server.add_tool(mcp::Tool{.name = "add",
+                            .description = "Adds two numbers.",
+                            .input_schema = json::object(),
+                            .handler = add_handler});
+  server.add_tool(mcp::Tool{.name = "boom",
+                            .description = "Always throws.",
+                            .input_schema = json::object(),
+                            .handler = boom_handler});
   return server;
 }
 
@@ -124,7 +130,10 @@ void test_tools_list_explicit_schema_and_description() {
   json schema = {{"type", "object"},
                  {"properties", {{"text", {{"type", "string"}}}}},
                  {"required", json::array({"text"})}};
-  server.add_tool(mcp::Tool{"say", "Say something.", schema, echo_handler});
+  server.add_tool(mcp::Tool{.name = "say",
+                            .description = "Say something.",
+                            .input_schema = schema,
+                            .handler = echo_handler});
 
   json reply = server.handle_message(
       json::parse(R"({"jsonrpc":"2.0","id":5,"method":"tools/list"})"));
@@ -220,8 +229,8 @@ void test_call_handler_other_exception() {
 
 void test_call_handler_result_with_content_passthrough() {
   mcp::McpServer server;
-  server.add_tool(mcp::Tool{"raw", "", json::object(),
-                            [](const json&) {
+  server.add_tool(mcp::Tool{.name = "raw", .input_schema = json::object(),
+                            .handler = [](const json&) {
                               json content_item = {{"type", "text"},
                                                    {"text", "raw"}};
                               return json{{"content", json::array({content_item})},
@@ -270,8 +279,14 @@ void test_non_object_message() {
 
 void test_add_tool_replaces_same_name() {
   mcp::McpServer server;
-  server.add_tool(mcp::Tool{"echo", "v1", json::object(), echo_handler});
-  server.add_tool(mcp::Tool{"echo", "v2", json::object(), echo_handler});
+  server.add_tool(mcp::Tool{.name = "echo",
+                            .description = "v1",
+                            .input_schema = json::object(),
+                            .handler = echo_handler});
+  server.add_tool(mcp::Tool{.name = "echo",
+                            .description = "v2",
+                            .input_schema = json::object(),
+                            .handler = echo_handler});
   CHECK(server.tools().size() == 1);
   CHECK(server.tools()[0].description == "v2");
 }

@@ -1,6 +1,6 @@
 # mcp-cpp Benchmark
 
-对比 mcp-cpp（C++17 / sogou-workflow）与官方 Python SDK（fastmcp）在 Streamable HTTP
+对比 mcp-cpp（C++20 / sogou-workflow）与官方 Python SDK（fastmcp）在 Streamable HTTP
 下的**并发 `tools/call`** 延迟与吞吐。
 
 ## 方法

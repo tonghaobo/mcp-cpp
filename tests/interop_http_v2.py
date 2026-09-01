@@ -34,10 +34,11 @@ async def check(client, tag: str) -> None:
 
 async def main() -> int:
     binary = sys.argv[1] if len(sys.argv) > 1 else "./build/mcp_http_example"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 8945
-    url = f"http://127.0.0.1:{port}/mcp"
+    host = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+    port = int(sys.argv[3]) if len(sys.argv) > 3 else 8945
+    url = f"http://{host}:{port}/mcp"
 
-    proc = subprocess.Popen([binary, str(port)],
+    proc = subprocess.Popen([binary, host, str(port)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True)
     try:

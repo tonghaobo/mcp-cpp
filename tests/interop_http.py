@@ -6,7 +6,7 @@ Verifies the "official Python SDK streamable-http client interop" (v1 session
 form): spawns mcp_http_example, connects via streamable_http_client,
 and runs initialize / list_tools / call_tool.
 
-Usage: interop_http.py <path-to-mcp_http_example> [port]   (SDK must be installed)
+Usage: interop_http.py <path-to-mcp_http_example> [host] [port]   (SDK must be installed)
 """
 
 import asyncio
@@ -22,10 +22,11 @@ from mcp.client.streamable_http import streamable_http_client
 
 async def main() -> int:
     binary = sys.argv[1] if len(sys.argv) > 1 else "./build/mcp_http_example"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 8931
-    url = f"http://127.0.0.1:{port}/mcp"
+    host = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+    port = int(sys.argv[3]) if len(sys.argv) > 3 else 8931
+    url = f"http://{host}:{port}/mcp"
 
-    proc = subprocess.Popen([binary, str(port)],
+    proc = subprocess.Popen([binary, host, str(port)],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             text=True)

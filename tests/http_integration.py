@@ -44,9 +44,10 @@ def request(port, body=None, method="POST", headers=None):
 
 def main() -> int:
     binary = sys.argv[1] if len(sys.argv) > 1 else "./build/mcp_http_example"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 8932
+    host = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+    port = int(sys.argv[3]) if len(sys.argv) > 3 else 8932
 
-    proc = subprocess.Popen([binary, str(port)],
+    proc = subprocess.Popen([binary, host, str(port)],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             text=True)
@@ -77,12 +78,12 @@ def main() -> int:
         status, _, raw = request(port, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         assert status == 400, (status, raw)
 
-        # 3. tools/list with session -> 200, 3 tools
+        # 3. tools/list with session -> 200, 4 tools
         status, _, raw = request(port, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
                                  headers={"Mcp-Session-Id": sid})
         assert status == 200, (status, raw)
         names = {t["name"] for t in json.loads(raw)["result"]["tools"]}
-        assert names == {"echo", "add", "get_time"}, names
+        assert names == {"echo", "add", "slow_add", "get_time"}, names
 
         # 4. tools/call add
         status, _, raw = request(port, {
@@ -92,6 +93,15 @@ def main() -> int:
         assert status == 200, (status, raw)
         text = json.loads(raw)["result"]["content"][0]["text"]
         assert json.loads(text)["sum"] == 5, text
+
+        # 4b. tools/call slow_add (async tool -> dispatched to a compute thread)
+        status, _, raw = request(port, {
+            "jsonrpc": "2.0", "id": 40, "method": "tools/call",
+            "params": {"name": "slow_add", "arguments": {"a": 4, "b": 6}}},
+            headers={"Mcp-Session-Id": sid})
+        assert status == 200, (status, raw)
+        text = json.loads(raw)["result"]["content"][0]["text"]
+        assert json.loads(text)["sum"] == 10, text
 
         # 5. tools/call unknown tool -> -32005
         status, _, raw = request(port, {

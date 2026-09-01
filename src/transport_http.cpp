@@ -4,6 +4,8 @@
 
 #include <workflow/HttpUtil.h>
 #include <workflow/WFHttpServer.h>
+#include <workflow/WFTaskFactory.h>
+#include <workflow/Workflow.h>
 
 #include <nlohmann/json.hpp>
 
@@ -46,13 +48,23 @@ std::string generate_session_id() {
 
 }  // namespace
 
-struct StreamableHttpTransport::Impl {
+struct StreamableHttpTransport::Impl
+    : std::enable_shared_from_this<StreamableHttpTransport::Impl> {
   // Workflow HTTP server. Created in run(); never moved.
   std::unique_ptr<WFHttpServer> server;
+
+  // Listen address and port; fixed at run() time.
+  std::string host;
+  uint16_t port = 0;
 
   // Message handler (set before run(); immutable afterwards). Owned here so the
   // workflow callback never touches the (possibly destroyed) transport.
   MessageHandler handler;
+
+  // Async probe (optional). Reports whether a named tool's handler should run
+  // off the transport thread. Immutable after run(); read by the process
+  // callback to decide whether a tool/call may be dispatched asynchronously.
+  StreamableHttpTransport::AsyncProbe async_probe;
 
   // Guard for sessions and stop.
   std::mutex mutex;
@@ -74,6 +86,19 @@ struct StreamableHttpTransport::Impl {
 
   // The process callback invoked by workflow for every HTTP request.
   void on_http_request(WFHttpTask* task);
+
+  // Run the handler for one decoded message and write the HTTP response. Shared
+  // by the synchronous path (called on the process thread) and the async path
+  // (called inside a go task's compute-thread function). Must not be called
+  // twice for the same task.
+  void run_handler_and_reply(WFHttpTask* task, const nlohmann::json& message,
+                             bool is_initialize, const std::string& sid);
+
+  // Dispatch a tool/call to a workflow compute thread via a go task. The go
+  // task runs run_handler_and_reply() off the transport thread; the process
+  // callback returns immediately. Requires async_probe to be set.
+  void dispatch_async(WFHttpTask* task, const nlohmann::json& message,
+                      bool is_initialize, const std::string& sid);
 
   void sweep_expired_sessions();
 };
@@ -142,6 +167,42 @@ void StreamableHttpTransport::Impl::sweep_expired_sessions() {
       ++it;
     }
   }
+}
+
+void StreamableHttpTransport::Impl::run_handler_and_reply(
+    WFHttpTask* task, const nlohmann::json& message, bool is_initialize,
+    const std::string& sid) {
+  HttpResponse* resp = task->get_resp();
+  const nlohmann::json reply = handler ? handler(message)
+                                       : nlohmann::json(nullptr);
+  if (reply.is_null()) {
+    // Notification (no id): 202 Accepted, no body.
+    resp->set_status_code("202");
+    resp->set_reason_phrase("Accepted");
+  } else {
+    respond_json(resp, 200, reply);
+  }
+  if (is_initialize) {
+    // Hand the freshly assigned session back in the response header.
+    resp->add_header_pair(kSessionHeader, sid.c_str());
+  }
+}
+
+void StreamableHttpTransport::Impl::dispatch_async(
+    WFHttpTask* task, const nlohmann::json& message, bool is_initialize,
+    const std::string& sid) {
+  // Move the handler execution off the transport thread. The go task runs
+  // run_handler_and_reply() on a workflow compute thread, then writes the
+  // response there. Capture a shared_ptr<Impl> so the handler/sessions outlive
+  // a concurrently destroyed transport. The WFHttpTask* stays valid because
+  // the go task is pushed onto the same series as the HTTP task: the response
+  // is written (and the HTTP task sent) only after the go task completes.
+  std::shared_ptr<Impl> impl = shared_from_this();
+  WFGoTask* go = WFTaskFactory::create_go_task(
+      "mcp", [impl, task, message, is_initialize, sid]() {
+        impl->run_handler_and_reply(task, message, is_initialize, sid);
+      });
+  series_of(task)->push_back(go);
 }
 
 void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
@@ -236,32 +297,46 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
     is_v2 = true;
   }
 
+  // Build the exact message to dispatch. For v2, stamp the modern protocol
+  // version into the message's _meta envelope so the transport-agnostic core
+  // can reliably detect a 2026-07-28 request (it routes off _meta, not the
+  // HTTP header). This covers requests that carry the version header but no
+  // _meta body envelope.
+  nlohmann::json dispatch_message = message;
   if (is_v2) {
-    // Stateless: no session required, no handshake. Stamp the modern protocol
-    // version into the message's _meta envelope so the transport-agnostic core
-    // can reliably detect a 2026-07-28 request (it routes off _meta, not the
-    // HTTP header). This covers requests that carry the version header but no
-    // _meta body envelope.
-    nlohmann::json v2_message = message;
-    if (!v2_message.contains("params") || !v2_message["params"].is_object()) {
-      v2_message["params"] = nlohmann::json::object();
+    if (!dispatch_message.contains("params") ||
+        !dispatch_message["params"].is_object()) {
+      dispatch_message["params"] = nlohmann::json::object();
     }
-    if (!v2_message["params"].contains("_meta") ||
-        !v2_message["params"]["_meta"].is_object()) {
-      v2_message["params"]["_meta"] = nlohmann::json::object();
+    if (!dispatch_message["params"].contains("_meta") ||
+        !dispatch_message["params"]["_meta"].is_object()) {
+      dispatch_message["params"]["_meta"] = nlohmann::json::object();
     }
-    v2_message["params"]["_meta"][kMetaProtocolVersionKey] =
+    dispatch_message["params"]["_meta"][kMetaProtocolVersionKey] =
         kProtocolVersionModern;
+  }
 
-    const nlohmann::json reply = handler ? handler(v2_message)
-                                         : nlohmann::json(nullptr);
-    if (reply.is_null()) {
-      // Notification: 202 Accepted, no body.
-      resp->set_status_code("202");
-      resp->set_reason_phrase("Accepted");
+  // Async probe: a tool/call targeting an async tool may be handed to a
+  // workflow compute thread so the (potentially slow) handler does not block
+  // the transport event loop. The probe is cheap and runs on the process
+  // thread; only the handler execution moves off-thread. Everything else
+  // (session bookkeeping, protocol routing) stays synchronous so its result is
+  // observed before the process callback returns.
+  bool want_async = false;
+  if (method_str == kMethodToolsCall && async_probe) {
+    const auto& p = dispatch_message["params"];
+    if (p.is_object() && p.contains("name") && p["name"].is_string()) {
+      want_async = async_probe(p["name"].get<std::string>());
+    }
+  }
+
+  if (is_v2) {
+    // Stateless: no session required, no handshake.
+    if (want_async) {
+      dispatch_async(task, dispatch_message, /*is_initialize=*/false, "");
       return;
     }
-    respond_json(resp, 200, reply);
+    run_handler_and_reply(task, dispatch_message, /*is_initialize=*/false, "");
     return;
   }
 
@@ -272,14 +347,11 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
       std::lock_guard<std::mutex> lock(mutex);
       sessions.emplace(sid, std::chrono::steady_clock::now());
     }
-    const nlohmann::json reply = handler ? handler(message)
-                                         : nlohmann::json(nullptr);
-    if (reply.is_null()) {
-      respond_json(resp, 200, nlohmann::json::object());
+    if (want_async) {
+      dispatch_async(task, dispatch_message, /*is_initialize=*/true, sid);
       return;
     }
-    respond_json(resp, 200, reply);
-    resp->add_header_pair(kSessionHeader, sid.c_str());
+    run_handler_and_reply(task, dispatch_message, /*is_initialize=*/true, sid);
     return;
   }
 
@@ -300,15 +372,11 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
     it->second = std::chrono::steady_clock::now();  // refresh last-seen
   }
 
-  const nlohmann::json reply = handler ? handler(message)
-                                       : nlohmann::json(nullptr);
-  if (reply.is_null()) {
-    // Notification: 202 Accepted, no body.
-    resp->set_status_code("202");
-    resp->set_reason_phrase("Accepted");
+  if (want_async) {
+    dispatch_async(task, dispatch_message, /*is_initialize=*/false, sid);
     return;
   }
-  respond_json(resp, 200, reply);
+  run_handler_and_reply(task, dispatch_message, /*is_initialize=*/false, sid);
 }
 
 // --------------------------------------------------------------------------
@@ -326,7 +394,15 @@ void StreamableHttpTransport::set_message_handler(MessageHandler handler) {
   impl_->handler = std::move(handler);
 }
 
+void StreamableHttpTransport::set_async_probe(AsyncProbe probe) {
+  impl_->async_probe = std::move(probe);
+}
+
 int StreamableHttpTransport::run(uint16_t port) {
+  return run("127.0.0.1", port);
+}
+
+int StreamableHttpTransport::run(const std::string& host, uint16_t port) {
   // run() is single-shot: rejecting re-entry avoids a std::terminate if a stale
   // reaper thread were reassigned.
   if (impl_->server) {
@@ -342,11 +418,15 @@ int StreamableHttpTransport::run(uint16_t port) {
     impl->on_http_request(task);
   };
 
+  impl_->host = host;
+  impl_->port = port;
   impl_->server = std::make_unique<WFHttpServer>(std::move(process));
-  // Bind loopback only (spec security note): never expose 0.0.0.0 by default.
-  if (impl_->server->start("127.0.0.1", port) != 0) {
-    std::fprintf(stderr, "StreamableHttpTransport: failed to listen on %u\n",
-                 static_cast<unsigned>(port));
+  // Bind the caller-supplied host (default run(port) -> 127.0.0.1, loopback
+  // only). Pass "0.0.0.0" to accept remote connections.
+  if (impl_->server->start(host.c_str(), port) != 0) {
+    std::fprintf(stderr,
+                 "StreamableHttpTransport: failed to listen on %s:%u\n",
+                 host.c_str(), static_cast<unsigned>(port));
     return 1;
   }
 
@@ -366,7 +446,8 @@ int StreamableHttpTransport::run(uint16_t port) {
 
   // Emit a readiness line only after the listener is up, so integration tests
   // and tooling can reliably detect "server is accepting connections".
-  std::printf("StreamableHttpTransport: listening on 127.0.0.1:%u\n", port);
+  std::printf("StreamableHttpTransport: listening on %s:%u\n", host.c_str(),
+              static_cast<unsigned>(port));
   std::fflush(stdout);
 
   // workflow runs a background scheduler; block until stop() is requested.

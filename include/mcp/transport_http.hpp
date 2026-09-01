@@ -56,10 +56,25 @@ class StreamableHttpTransport {
 
   void set_message_handler(MessageHandler handler);
 
+  // Optional: given a tool name, reports whether its handler should run off the
+  // transport thread (async). When a tool/call targets an async tool, the
+  // transport dispatches it to a workflow compute thread via a go task; the
+  // process thread returns immediately and the response is written once the
+  // handler completes. Without a probe (or when the probe returns false) every
+  // tool runs synchronously on the transport thread.
+  using AsyncProbe = std::function<bool(const std::string& tool_name)>;
+  void set_async_probe(AsyncProbe probe);
+
   // Start the HTTP server on the given port and block until stop() is called.
   // Returns the process exit code (0 on a clean stop). Listens on 127.0.0.1.
   // run() is single-shot and not re-entrant: calling it twice returns 1.
   int run(uint16_t port);
+
+  // Like run(port) but binds the given host/address explicitly, so the server
+  // can listen on a specific interface (e.g. "0.0.0.0" to accept remote
+  // connections) instead of loopback-only. host is passed to workflow's
+  // WFHttpServer::start(host, port); use a numeric address or resolvable name.
+  int run(const std::string& host, uint16_t port);
 
   // Ask the server to stop. Safe to call from another thread; run() returns.
   void stop();

@@ -36,6 +36,15 @@ void McpServer::add_tool(Tool tool) {
   tools_.push_back(std::move(tool));
 }
 
+bool McpServer::is_tool_async(const std::string& name) const {
+  for (const auto& tool : tools_) {
+    if (tool.name == name) {
+      return tool.async;
+    }
+  }
+  return false;
+}
+
 nlohmann::json McpServer::handle_message(const nlohmann::json& message) {
   try {
     // Only requests and notifications reach the server core.
