@@ -19,7 +19,13 @@
 ```bash
 # 一键：容器内构建 mcp-cpp + 启动两个服务器 + 压测
 REQUESTS=2000 CONCS="100 500 1000" ./scripts/benchmark.sh
+
+# 本机（不用 Docker）：本机编译产物 + 本地 venv，同样跑两轮
+REQUESTS=2000 CONCS="100 500 1000" ./scripts/benchmark_local.sh
 ```
+
+> 本机模式下 server 与压测客户端**争抢同一台机器的 CPU**（4 核机上高并发时客户端先饱和），
+> 测得数值**不可直接与下方容器内数据对比**，只适合冒烟验证与相对趋势。
 
 环境：Linux Docker（`mcp-cpp-builder`），`uvicorn 0.52`，`fastmcp 3.4`，`mcp 2.1.1`，
 `python 3.12`。请求走 `127.0.0.1` 回环。

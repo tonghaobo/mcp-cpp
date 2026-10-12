@@ -207,7 +207,7 @@ v1 形态并发 `tools/call` `add`（相同工具、同容器、同压测客户�
 ├── examples/                   # echo_server.cpp（stdio）· http_server.cpp（Streamable HTTP）
 ├── tests/                      # 单元 + 集成 + SDK 互通测试
 ├── benchmark/                  # 性能基准：bench.py + fastmcp_server.py + README
-└── scripts/                    # build_docker.sh / interop.sh / benchmark.sh
+└── scripts/                    # build_docker.sh / interop.sh / benchmark.sh / benchmark_local.sh
 ```
 
 ## License
