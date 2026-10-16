@@ -50,9 +50,6 @@ std::string generate_session_id() {
 
 struct StreamableHttpTransport::Impl
     : std::enable_shared_from_this<StreamableHttpTransport::Impl> {
-  // Workflow HTTP server. Created in run(); never moved.
-  std::unique_ptr<WFHttpServer> server;
-
   // Listen address and port; fixed at run() time.
   std::string host;
   uint16_t port = 0;
@@ -73,16 +70,14 @@ struct StreamableHttpTransport::Impl
   // unboundedly (resource-exhaustion guard).
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> sessions;
   std::atomic<bool> stop_requested{false};
-  // Reaper thread id; joined in stop(). Idle-session sweep.
-  std::thread reaper;
+  // Set by the first run(); run() is single-shot (second call returns 1).
+  std::atomic<bool> started{false};
 
   // Session idle timeout and sweep cadence.
   static constexpr std::chrono::seconds kSessionTimeout{60 * 30};  // 30 min
   static constexpr std::chrono::seconds kSweepInterval{60};        // every 1 min
   // Reaper wakes every tick to honour stop() promptly (join latency <= tick).
   static constexpr std::chrono::seconds kReaperTick{1};
-
-  ~Impl();
 
   // The process callback invoked by workflow for every HTTP request.
   void on_http_request(WFHttpTask* task);
@@ -150,12 +145,6 @@ void respond_json(HttpResponse* resp, int status, const nlohmann::json& payload)
 }
 
 }  // namespace
-
-StreamableHttpTransport::Impl::~Impl() {
-  if (reaper.joinable()) {
-    reaper.join();
-  }
-}
 
 void StreamableHttpTransport::Impl::sweep_expired_sessions() {
   const auto now = std::chrono::steady_clock::now();
@@ -403,9 +392,9 @@ int StreamableHttpTransport::run(uint16_t port) {
 }
 
 int StreamableHttpTransport::run(const std::string& host, uint16_t port) {
-  // run() is single-shot: rejecting re-entry avoids a std::terminate if a stale
-  // reaper thread were reassigned.
-  if (impl_->server) {
+  // run() is single-shot: rejecting re-entry keeps a second listener from being
+  // started on this Impl.
+  if (impl_->started.exchange(true)) {
     std::fprintf(stderr,
                  "StreamableHttpTransport: run() is not re-entrant\n");
     return 1;
@@ -420,10 +409,12 @@ int StreamableHttpTransport::run(const std::string& host, uint16_t port) {
 
   impl_->host = host;
   impl_->port = port;
-  impl_->server = std::make_unique<WFHttpServer>(std::move(process));
+  // Owned here, not by Impl: as an Impl member the server's copy of the process
+  // lambda would keep Impl alive and neither would ever be freed (cycle).
+  WFHttpServer server(std::move(process));
   // Bind the caller-supplied host (default run(port) -> 127.0.0.1, loopback
   // only). Pass "0.0.0.0" to accept remote connections.
-  if (impl_->server->start(host.c_str(), port) != 0) {
+  if (server.start(host.c_str(), port) != 0) {
     std::fprintf(stderr,
                  "StreamableHttpTransport: failed to listen on %s:%u\n",
                  host.c_str(), static_cast<unsigned>(port));
@@ -433,7 +424,9 @@ int StreamableHttpTransport::run(const std::string& host, uint16_t port) {
   // Background reaper: bound the session set by sweeping idle sessions. Wakes
   // every tick so stop() is honoured within ~1s; sweeps when kSweepInterval has
   // elapsed (time-based, so it does not depend on tick/sweep divisibility).
-  impl_->reaper = std::thread([impl = impl_] {
+  // Owned and joined here for the same reason as server: it captures Impl, so
+  // leaving it running past run() would keep Impl alive.
+  std::thread reaper([impl = impl_] {
     auto deadline = std::chrono::steady_clock::now() + Impl::kSweepInterval;
     while (!impl->stop_requested.load()) {
       std::this_thread::sleep_for(Impl::kReaperTick);
@@ -454,7 +447,8 @@ int StreamableHttpTransport::run(const std::string& host, uint16_t port) {
   while (!impl_->stop_requested.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
-  impl_->server->stop();
+  server.stop();
+  reaper.join();
   return 0;
 }
 
