@@ -7,14 +7,15 @@ dependency. Exercises the full happy path plus every error branch:
    1. initialize                -> result with protocolVersion/capabilities/serverInfo
    2. notifications/initialized -> silent (no reply; verified via the next ping)
    3. ping                      -> empty result
-   4. tools/list                -> 3 tools
+   4. tools/list                -> 4 tools
    5. tools/call echo           -> text echoed
    6. tools/call add            -> sum
-   7. tools/call unknown tool   -> -32005
-   8. unknown method            -> -32601
-   9. tools/call bad arguments  -> -32602
-  10. invalid JSON              -> -32700 (id null)
-  11. stdin EOF                 -> process exits 0
+   7. tools/call slow_query     -> deferred; reply arrives out of order by id
+   8. tools/call unknown tool   -> -32005
+   9. unknown method            -> -32601
+  10. tools/call bad arguments  -> -32602
+  11. invalid JSON              -> -32700 (id null)
+  12. stdin EOF                 -> process exits 0
 
 Usage: stdio_integration.py <path-to-mcp_example>
 """
@@ -99,7 +100,7 @@ def main() -> int:
         reply = recv(proc)
         expect_response(reply, 3)
         names = {t["name"] for t in reply["result"]["tools"]}
-        assert names == {"echo", "add", "get_time"}, names
+        assert names == {"echo", "add", "get_time", "slow_query"}, names
 
         # 5. tools/call echo
         send(proc, {
@@ -128,7 +129,23 @@ def main() -> int:
         text = reply["result"]["content"][0]["text"]
         assert json.loads(text)["sum"] == 5, text
 
-        # 7. tools/call unknown tool -> -32005
+        # 7. deferred tool: slow_query replies ~500ms later, so the ping sent
+        #    right after must be answered first (out of order, matched by id).
+        send(proc, {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "slow_query", "arguments": {"rows": 7}},
+        })
+        send(proc, {"jsonrpc": "2.0", "id": 10, "method": "ping"})
+        reply = recv(proc)
+        expect_response(reply, 10)
+        reply = recv(proc)
+        expect_response(reply, 9)
+        text = reply["result"]["content"][0]["text"]
+        assert json.loads(text)["rows"] == 7, text
+
+        # 8. tools/call unknown tool -> -32005
         send(proc, {
             "jsonrpc": "2.0",
             "id": 6,
@@ -139,13 +156,13 @@ def main() -> int:
         assert reply["id"] == 6, reply
         assert reply["error"]["code"] == -32005, reply
 
-        # 8. unknown method -> -32601
+        # 9. unknown method -> -32601
         send(proc, {"jsonrpc": "2.0", "id": 7, "method": "no/such/method"})
         reply = recv(proc)
         assert reply["id"] == 7, reply
         assert reply["error"]["code"] == -32601, reply
 
-        # 9. tools/call bad arguments -> -32602
+        # 10. tools/call bad arguments -> -32602
         send(proc, {
             "jsonrpc": "2.0",
             "id": 8,
@@ -156,13 +173,13 @@ def main() -> int:
         assert reply["id"] == 8, reply
         assert reply["error"]["code"] == -32602, reply
 
-        # 10. invalid JSON -> -32700, id null
+        # 11. invalid JSON -> -32700, id null
         send(proc, "{this is not json")
         reply = recv(proc)
         assert reply["id"] is None, reply
         assert reply["error"]["code"] == -32700, reply
 
-        # 11. EOF -> graceful exit with code 0
+        # 12. EOF -> graceful exit with code 0
         proc.stdin.close()
         returncode = proc.wait(timeout=RECV_TIMEOUT)
         assert returncode == 0, f"expected exit 0, got {returncode}"
@@ -181,7 +198,7 @@ def main() -> int:
             print(f"server stderr:\n{stderr}", file=sys.stderr)
         return 1
 
-    print("stdio_integration: all 11 steps passed")
+    print("stdio_integration: all 12 steps passed")
     return 0
 
 

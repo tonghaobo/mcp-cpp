@@ -24,6 +24,7 @@
 // It reuses McpServer::handle_message unchanged for JSON-RPC dispatch.
 #pragma once
 
+#include <mcp/dispatch.hpp>
 #include <mcp/jsonrpc.hpp>
 
 #include <nlohmann/json.hpp>
@@ -39,14 +40,16 @@ namespace mcp {
 
 class StreamableHttpTransport {
  public:
-  // Handler decodes one JSON-RPC message and returns the reply to send, or a
-  // null json when nothing should be sent back (e.g. a notification).
+  // Handler decodes one JSON-RPC message and calls `done` with the reply to
+  // send, or with a null json when nothing should be sent back (notifications).
+  // For a request owned by a kDeferred tool, `done` may be called later and
+  // from another thread; the connection stays open until then.
   //
   // NOTE: the handler (and the user tool handlers it dispatches to) may be
   // invoked concurrently from multiple workflow threads. Tool handlers must be
   // thread-safe; McpServer is safe to dispatch concurrently (tools_ is read-only
   // after registration, initialized_ is atomic).
-  using MessageHandler = std::function<nlohmann::json(const nlohmann::json&)>;
+  using MessageHandler = std::function<void(const nlohmann::json&, Done)>;
 
   StreamableHttpTransport();
   ~StreamableHttpTransport();
@@ -56,14 +59,13 @@ class StreamableHttpTransport {
 
   void set_message_handler(MessageHandler handler);
 
-  // Optional: given a tool name, reports whether its handler should run off the
-  // transport thread (async). When a tool/call targets an async tool, the
-  // transport dispatches it to a workflow compute thread via a go task; the
-  // process thread returns immediately and the response is written once the
-  // handler completes. Without a probe (or when the probe returns false) every
-  // tool runs synchronously on the transport thread.
-  using AsyncProbe = std::function<bool(const std::string& tool_name)>;
-  void set_async_probe(AsyncProbe probe);
+  // Optional: given a tool name, reports how its handler must run. kThread
+  // hands the call to a framework worker thread (the process thread returns at
+  // once); kDeferred parks the request until the tool replies through Done,
+  // holding no thread while it waits. Without a probe (or for kInline) the call
+  // is answered synchronously on the transport thread.
+  using DispatchProbe = std::function<Dispatch(const std::string& tool_name)>;
+  void set_dispatch_probe(DispatchProbe probe);
 
   // Start the HTTP server on the given port and block until stop() is called.
   // Returns the process exit code (0 on a clean stop). Listens on 127.0.0.1.

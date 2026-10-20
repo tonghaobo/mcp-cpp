@@ -71,6 +71,7 @@ if(MCP_BUILD_EXAMPLES)
   if(MCP_ENABLE_WORKFLOW)
     add_executable(mcp_http_example examples/http_server.cpp)
     target_link_libraries(mcp_http_example PRIVATE mcp)
+
   endif()
 endif()
 
@@ -85,6 +86,12 @@ if(MCP_BUILD_TESTS)
   add_executable(server_test tests/server_test.cpp)
   target_link_libraries(server_test PRIVATE mcp)
   add_test(NAME server_test COMMAND server_test)
+
+  if(MCP_ENABLE_WORKFLOW)
+    add_executable(http_dispatch_test tests/http_dispatch_test.cpp)
+    target_link_libraries(http_dispatch_test PRIVATE mcp)
+    add_test(NAME http_dispatch_test COMMAND http_dispatch_test)
+  endif()
 
   if(MCP_BUILD_EXAMPLES)
     find_package(Python3 COMPONENTS Interpreter QUIET)

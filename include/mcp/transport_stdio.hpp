@@ -3,6 +3,8 @@
 
 #include <mcp/transport.hpp>
 
+#include <mutex>
+
 namespace mcp {
 
 class StdioTransport : public ITransport {
@@ -13,6 +15,9 @@ class StdioTransport : public ITransport {
 
  private:
   MessageHandler handler_;
+
+  // A kDeferred tool may reply from another thread while run() keeps reading.
+  std::mutex mutex_;
 };
 
 }  // namespace mcp

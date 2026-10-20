@@ -1,6 +1,8 @@
 // mcp-cpp: Tool definition and registration API.
 #pragma once
 
+#include <mcp/dispatch.hpp>
+
 #include <nlohmann/json.hpp>
 
 #include <functional>
@@ -10,15 +12,9 @@ namespace mcp {
 
 // One registered tool.
 //
-// `handler` returns the tool result synchronously. Its execution thread depends
-// on `async`:
-//   - async == false (default): the handler runs inline on the transport
-//     (process) thread; the request is fully handled before it returns.
-//   - async == true: the transport hands the tool/call to a workflow compute
-//     thread (go task); the process thread returns immediately without
-//     blocking, and the response is written once the handler completes. Use
-//     this for slow handlers so they do not stall the HTTP event loop.
-// Either way the Handler signature is the same; only the executor changes.
+// The handler shape follows `dispatch`: `handler` returns the result
+// synchronously (kInline / kThread), `deferred` receives a Done and may reply
+// at once or hand it to another thread (kDeferred). Set the one you declared.
 //
 // Initialize with C++20 designated initializers so field order is never an
 // issue when adding new fields:
@@ -28,10 +24,11 @@ struct Tool {
   using Handler = std::function<nlohmann::json(const nlohmann::json& args)>;
 
   std::string name;
-  std::string description;                     // optional; empty -> omitted from tools/list
-  nlohmann::json input_schema;                 // JSON Schema for `arguments`
-  Handler handler;                             // required; tools/call fails otherwise
-  bool async = false;                          // true -> run handler off the transport thread
+  std::string description;                 // optional; empty -> omitted from tools/list
+  nlohmann::json input_schema;             // JSON Schema for `arguments`
+  Handler handler;                         // required for kInline / kThread
+  Dispatch dispatch = Dispatch::kInline;   // execution model; see dispatch.hpp
+  DeferredHandler deferred;                // required for kDeferred
 
   // Serialize into a tools/list result entry.
   nlohmann::json to_json() const;

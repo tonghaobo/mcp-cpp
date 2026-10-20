@@ -6,8 +6,11 @@ happy path (v1 session form) plus error branches:
 
    1. initialize                       -> 200 JSON + Mcp-Session-Id header
    2. tools/list without session       -> 400 (session required)
-   3. tools/list with session          -> 200 JSON, 3 tools
+   3. tools/list with session          -> 200 JSON, 5 tools
    4. tools/call add                   -> 200 JSON, sum
+  4b. tools/call slow_add (kThread)    -> 200 JSON, sum
+  4c. tools/call slow_query (kDeferred)-> 200 JSON, rows; replies 2s later
+                                         while other calls stay fast
    5. tools/call unknown tool          -> 200 JSON, -32005
    6. unknown method                   -> 200 JSON, -32601
    7. notification (no id)             -> 202 Accepted, no body
@@ -22,6 +25,7 @@ import http.client
 import json
 import subprocess
 import sys
+import threading
 import time
 
 PATH = "/mcp"
@@ -83,7 +87,7 @@ def main() -> int:
                                  headers={"Mcp-Session-Id": sid})
         assert status == 200, (status, raw)
         names = {t["name"] for t in json.loads(raw)["result"]["tools"]}
-        assert names == {"echo", "add", "slow_add", "get_time"}, names
+        assert names == {"echo", "add", "slow_add", "slow_query", "get_time"}, names
 
         # 4. tools/call add
         status, _, raw = request(port, {
@@ -102,6 +106,34 @@ def main() -> int:
         assert status == 200, (status, raw)
         text = json.loads(raw)["result"]["content"][0]["text"]
         assert json.loads(text)["sum"] == 10, text
+
+        # 4c. tools/call slow_query (kDeferred): the server holds no thread
+        #     while it waits, so a call made during the wait must stay fast,
+        #     and the deferred reply must still carry the handler's output.
+        deferred = {}
+
+        def call_slow_query():
+            deferred["reply"] = request(port, {
+                "jsonrpc": "2.0", "id": 41, "method": "tools/call",
+                "params": {"name": "slow_query", "arguments": {"rows": 5}}},
+                headers={"Mcp-Session-Id": sid})
+
+        worker = threading.Thread(target=call_slow_query)
+        worker.start()
+        time.sleep(0.2)
+        started = time.monotonic()
+        status, _, raw = request(port, {
+            "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": "still fast"}}},
+            headers={"Mcp-Session-Id": sid})
+        elapsed = time.monotonic() - started
+        assert status == 200, (status, raw)
+        assert elapsed < 1.0, f"call blocked by the pending deferred call: {elapsed:.2f}s"
+        worker.join()
+        status, _, raw = deferred["reply"]
+        assert status == 200, (status, raw)
+        text = json.loads(raw)["result"]["content"][0]["text"]
+        assert json.loads(text)["rows"] == 5, text
 
         # 5. tools/call unknown tool -> -32005
         status, _, raw = request(port, {

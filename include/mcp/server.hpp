@@ -42,14 +42,20 @@ class McpServer {
   // All registered tools, in registration order.
   const std::vector<Tool>& tools() const { return tools_; }
 
-  // True if the named tool is registered with async execution enabled. Used by
-  // the HTTP transport to decide whether a tool/call may be dispatched to a
-  // compute thread instead of the transport thread.
-  bool is_tool_async(const std::string& name) const;
+  // Execution model the named tool declared (kInline when it is not
+  // registered). The HTTP transport uses this to decide how to run a tool/call.
+  Dispatch tool_dispatch(const std::string& name) const;
 
   // Handle one decoded JSON-RPC message (a request or notification object, as
-  // produced by the transport layer). Returns the JSON to reply with, or a
-  // null json when nothing should be sent back. Never throws.
+  // produced by the transport layer). `done` is called exactly once: before
+  // returning for every reply the core can produce itself, or later (possibly
+  // from another thread) when a kDeferred tool replies. A null json means
+  // nothing should be sent back. Never throws.
+  void handle_message(const nlohmann::json& message, Done done);
+
+  // Convenience for callers that cannot handle a late reply (unit tests, or a
+  // server with no kDeferred tools): returns the reply, or a null json when
+  // nothing should be sent. A completion arriving after this returns is dropped.
   nlohmann::json handle_message(const nlohmann::json& message);
 
   // True once a client has sent notifications/initialized. Atomic so that the
@@ -60,8 +66,8 @@ class McpServer {
   nlohmann::json handle_initialize(const nlohmann::json& id);
   nlohmann::json handle_server_discover(const nlohmann::json& id);
   nlohmann::json handle_tools_list(const nlohmann::json& id, bool v2);
-  nlohmann::json handle_tools_call(const nlohmann::json& id,
-                                   const nlohmann::json& message, bool v2);
+  void handle_tools_call(const nlohmann::json& id,
+                         const nlohmann::json& message, bool v2, Done done);
 
   ServerOptions options_;
   std::vector<Tool> tools_;

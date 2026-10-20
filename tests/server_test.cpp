@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 using nlohmann::json;
 using mcp::jsonrpc::kInvalidParams;
@@ -291,6 +292,94 @@ void test_add_tool_replaces_same_name() {
   CHECK(server.tools()[0].description == "v2");
 }
 
+json call_msg(const std::string& name) {
+  return json{{"jsonrpc", "2.0"},
+              {"id", 1},
+              {"method", "tools/call"},
+              {"params", {{"name", name}, {"arguments", json::object()}}}};
+}
+
+// A kDeferred tool that answers only when the test calls the stored Done.
+struct DeferredTool {
+  static mcp::Tool make(mcp::Done* slot, const std::string& name = "slow") {
+    return mcp::Tool{.name = name,
+                     .description = "Defers its reply.",
+                     .input_schema = json::object(),
+                     .dispatch = mcp::Dispatch::kDeferred,
+                     .deferred = [slot](const json& args, mcp::Done done) {
+                       *slot = std::move(done);
+                     }};
+  }
+};
+
+void test_deferred_tool_replies_after_return() {
+  mcp::Done pending;
+  mcp::McpServer server;
+  server.add_tool(DeferredTool::make(&pending));
+
+  bool replied = false;
+  json out;
+  server.handle_message(
+      json::parse(R"({"jsonrpc":"2.0","id":7,"method":"tools/call",
+        "params":{"name":"slow","arguments":{"rows":3}}})"),
+      [&](json response) {
+        replied = true;
+        out = std::move(response);
+      });
+  CHECK(!replied);  // the tool has not answered yet
+  CHECK(pending != nullptr);
+
+  pending(json{{"rows", 3}});  // tool output, wrapped by the core
+  CHECK(replied);
+  CHECK(out["id"] == 7);
+  CHECK(out["result"]["isError"] == false);
+  const std::string text = out["result"]["content"][0]["text"];
+  CHECK(json::parse(text)["rows"] == 3);
+}
+
+void test_dispatch_lookup() {
+  mcp::Done ignored;
+  mcp::McpServer server = make_server();
+  server.add_tool(DeferredTool::make(&ignored, "slow"));
+  CHECK(server.tool_dispatch("slow") == mcp::Dispatch::kDeferred);
+  CHECK(server.tool_dispatch("echo") == mcp::Dispatch::kInline);
+  CHECK(server.tool_dispatch("nope") == mcp::Dispatch::kInline);
+}
+
+void test_sync_wrapper_drops_late_reply() {
+  mcp::Done pending;
+  mcp::McpServer server;
+  server.add_tool(DeferredTool::make(&pending));
+
+  json reply = server.handle_message(call_msg("slow"));
+  CHECK(reply.is_null());  // nothing to send: the tool is still working
+  pending(json{{"rows", 1}});  // a late completion must be dropped, not crash
+}
+
+void test_deferred_tool_without_handler() {
+  mcp::McpServer server;
+  server.add_tool(mcp::Tool{.name = "broken",
+                            .description = "Deferred without handler.",
+                            .input_schema = json::object(),
+                            .dispatch = mcp::Dispatch::kDeferred});
+  json reply = server.handle_message(call_msg("broken"));
+  CHECK(reply["error"]["code"] == kInternalError);
+}
+
+void test_deferred_handler_throws_invalid_argument() {
+  mcp::McpServer server;
+  server.add_tool(mcp::Tool{
+      .name = "slow",
+      .description = "Throws before replying.",
+      .input_schema = json::object(),
+      .dispatch = mcp::Dispatch::kDeferred,
+      .deferred = [](const json&, mcp::Done) {
+        throw std::invalid_argument("bad arguments");
+      }});
+  json reply = server.handle_message(call_msg("slow"));
+  CHECK(reply["error"]["code"] == kInvalidParams);
+}
+
 }  // namespace
 
 int main() {
@@ -314,6 +403,11 @@ int main() {
   test_unknown_notification_ignored();
   test_non_object_message();
   test_add_tool_replaces_same_name();
+  test_deferred_tool_replies_after_return();
+  test_dispatch_lookup();
+  test_sync_wrapper_drops_late_reply();
+  test_deferred_tool_without_handler();
+  test_deferred_handler_throws_invalid_argument();
 
   if (g_failures == 0) {
     std::cout << "server_test: all tests passed\n";

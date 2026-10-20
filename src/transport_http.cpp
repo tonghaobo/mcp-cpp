@@ -9,9 +9,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -58,10 +61,9 @@ struct StreamableHttpTransport::Impl
   // workflow callback never touches the (possibly destroyed) transport.
   MessageHandler handler;
 
-  // Async probe (optional). Reports whether a named tool's handler should run
-  // off the transport thread. Immutable after run(); read by the process
-  // callback to decide whether a tool/call may be dispatched asynchronously.
-  StreamableHttpTransport::AsyncProbe async_probe;
+  // Dispatch probe (optional). Reports how a named tool's handler must run;
+  // immutable after run(), read by the process callback.
+  StreamableHttpTransport::DispatchProbe dispatch_probe;
 
   // Guard for sessions and stop.
   std::mutex mutex;
@@ -82,18 +84,23 @@ struct StreamableHttpTransport::Impl
   // The process callback invoked by workflow for every HTTP request.
   void on_http_request(WFHttpTask* task);
 
-  // Run the handler for one decoded message and write the HTTP response. Shared
-  // by the synchronous path (called on the process thread) and the async path
-  // (called inside a go task's compute-thread function). Must not be called
-  // twice for the same task.
+  // Run the handler for one decoded message and write the HTTP response. Used
+  // for kInline (process thread) and kThread (compute thread); the handler must
+  // finish inside this call. Must not be called twice for the same task.
   void run_handler_and_reply(WFHttpTask* task, const nlohmann::json& message,
                              bool is_initialize, const std::string& sid);
 
-  // Dispatch a tool/call to a workflow compute thread via a go task. The go
-  // task runs run_handler_and_reply() off the transport thread; the process
-  // callback returns immediately. Requires async_probe to be set.
+  // Dispatch a tool/call to a workflow compute thread via a go task, so a
+  // blocking handler holds at most one worker thread instead of a transport
+  // one. The go task runs run_handler_and_reply() and writes the response there.
   void dispatch_async(WFHttpTask* task, const nlohmann::json& message,
                       bool is_initialize, const std::string& sid);
+
+  // Dispatch a tool/call that answers later (kDeferred): the request is parked
+  // on a counter gate, so it holds no thread while the tool waits for whatever
+  // it is waiting for. The tool calls Done (from any thread) to finish it.
+  void dispatch_deferred(WFHttpTask* task, const nlohmann::json& message,
+                         bool is_initialize, const std::string& sid);
 
   void sweep_expired_sessions();
 };
@@ -144,6 +151,69 @@ void respond_json(HttpResponse* resp, int status, const nlohmann::json& payload)
   resp->append_output_body(body.c_str(), body.size());
 }
 
+// Write the HTTP response for one call. A null reply means the message needs no
+// answer (a notification): 202 Accepted with an empty body.
+void write_reply(WFHttpTask* task, const nlohmann::json& reply,
+                 bool is_initialize, const std::string& sid) {
+  HttpResponse* resp = task->get_resp();
+  if (reply.is_null()) {
+    resp->set_status_code("202");
+    resp->set_reason_phrase("Accepted");
+  } else {
+    respond_json(resp, 200, reply);
+  }
+  if (is_initialize) {
+    // Hand the freshly assigned session back in the response header.
+    resp->add_header_pair(kSessionHeader, sid.c_str());
+  }
+}
+
+// One call whose reply arrives later (kDeferred). The HTTP task stays parked on
+// a counter gate until Done is called -- from any thread, possibly long after
+// the handler returned -- which costs no thread while waiting.
+class DeferredCall : public std::enable_shared_from_this<DeferredCall> {
+ public:
+  DeferredCall(WFHttpTask* task, bool is_initialize, std::string sid)
+      : task_(task), is_initialize_(is_initialize), sid_(std::move(sid)) {}
+
+  // Keep the series -- and with it the connection -- alive. Called from the
+  // process callback, before the handler can possibly reply.
+  void park(SeriesWork* series) {
+    gate_ = WFTaskFactory::create_counter_task(
+        1, [self = shared_from_this()](WFCounterTask*) { self->finalize(); });
+    series->push_back(gate_);
+  }
+
+  Done done_fn() {
+    return [self = shared_from_this()](nlohmann::json reply) {
+      self->finish(std::move(reply));
+    };
+  }
+
+ private:
+  void finish(nlohmann::json reply) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (replied_) {
+        return;  // Done is idempotent: only the first call counts
+      }
+      replied_ = true;
+      reply_ = std::move(reply);
+    }
+    gate_->count();  // the gate callback writes the response
+  }
+
+  void finalize() { write_reply(task_, reply_, is_initialize_, sid_); }
+
+  WFHttpTask* task_;
+  bool is_initialize_;
+  std::string sid_;
+  WFCounterTask* gate_ = nullptr;
+  std::mutex mutex_;
+  bool replied_ = false;
+  nlohmann::json reply_;
+};
+
 }  // namespace
 
 void StreamableHttpTransport::Impl::sweep_expired_sessions() {
@@ -161,19 +231,35 @@ void StreamableHttpTransport::Impl::sweep_expired_sessions() {
 void StreamableHttpTransport::Impl::run_handler_and_reply(
     WFHttpTask* task, const nlohmann::json& message, bool is_initialize,
     const std::string& sid) {
-  HttpResponse* resp = task->get_resp();
-  const nlohmann::json reply = handler ? handler(message)
-                                       : nlohmann::json(nullptr);
-  if (reply.is_null()) {
-    // Notification (no id): 202 Accepted, no body.
-    resp->set_status_code("202");
-    resp->set_reason_phrase("Accepted");
+  // The handler answers within this call, so write the response right here. A
+  // completion arriving later (a tool that ignores its Dispatch) is dropped.
+  auto replied = std::make_shared<std::atomic<bool>>(false);
+  Done done = [task, is_initialize, sid, replied](nlohmann::json reply) {
+    if (replied->exchange(true)) {
+      return;
+    }
+    write_reply(task, reply, is_initialize, sid);
+  };
+  if (handler) {
+    handler(message, std::move(done));
   } else {
-    respond_json(resp, 200, reply);
+    done(nullptr);
   }
-  if (is_initialize) {
-    // Hand the freshly assigned session back in the response header.
-    resp->add_header_pair(kSessionHeader, sid.c_str());
+}
+
+void StreamableHttpTransport::Impl::dispatch_deferred(
+    WFHttpTask* task, const nlohmann::json& message, bool is_initialize,
+    const std::string& sid) {
+  // Park the series first: the handler may call Done from inside this call,
+  // from another thread, or much later -- all three are fine, and the response
+  // is written once the gate completes.
+  auto call = std::make_shared<DeferredCall>(task, is_initialize, sid);
+  call->park(series_of(task));
+  Done done = call->done_fn();
+  if (handler) {
+    handler(message, std::move(done));
+  } else {
+    done(nullptr);
   }
 }
 
@@ -305,27 +391,34 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
         kProtocolVersionModern;
   }
 
-  // Async probe: a tool/call targeting an async tool may be handed to a
-  // workflow compute thread so the (potentially slow) handler does not block
-  // the transport event loop. The probe is cheap and runs on the process
-  // thread; only the handler execution moves off-thread. Everything else
-  // (session bookkeeping, protocol routing) stays synchronous so its result is
-  // observed before the process callback returns.
-  bool want_async = false;
-  if (method_str == kMethodToolsCall && async_probe) {
+  // Dispatch probe: only tool/call is routed by execution model. The probe is
+  // cheap and runs on the process thread; session bookkeeping and protocol
+  // routing stay synchronous so their result is known before the callback
+  // returns.
+  Dispatch dispatch = Dispatch::kInline;
+  if (method_str == kMethodToolsCall && dispatch_probe) {
     const auto& p = dispatch_message["params"];
     if (p.is_object() && p.contains("name") && p["name"].is_string()) {
-      want_async = async_probe(p["name"].get<std::string>());
+      dispatch = dispatch_probe(p["name"].get<std::string>());
     }
   }
 
+  // kDeferred parks the request and replies when the tool is done (no thread
+  // held while it waits); kThread moves the handler to a worker thread; kInline
+  // answers right here on the process thread.
+  auto dispatch_call = [&](bool is_init, const std::string& call_sid) {
+    if (dispatch == Dispatch::kDeferred) {
+      dispatch_deferred(task, dispatch_message, is_init, call_sid);
+    } else if (dispatch == Dispatch::kThread) {
+      dispatch_async(task, dispatch_message, is_init, call_sid);
+    } else {
+      run_handler_and_reply(task, dispatch_message, is_init, call_sid);
+    }
+  };
+
   if (is_v2) {
     // Stateless: no session required, no handshake.
-    if (want_async) {
-      dispatch_async(task, dispatch_message, /*is_initialize=*/false, "");
-      return;
-    }
-    run_handler_and_reply(task, dispatch_message, /*is_initialize=*/false, "");
+    dispatch_call(/*is_init=*/false, "");
     return;
   }
 
@@ -336,11 +429,7 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
       std::lock_guard<std::mutex> lock(mutex);
       sessions.emplace(sid, std::chrono::steady_clock::now());
     }
-    if (want_async) {
-      dispatch_async(task, dispatch_message, /*is_initialize=*/true, sid);
-      return;
-    }
-    run_handler_and_reply(task, dispatch_message, /*is_initialize=*/true, sid);
+    dispatch_call(/*is_init=*/true, sid);
     return;
   }
 
@@ -361,11 +450,7 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
     it->second = std::chrono::steady_clock::now();  // refresh last-seen
   }
 
-  if (want_async) {
-    dispatch_async(task, dispatch_message, /*is_initialize=*/false, sid);
-    return;
-  }
-  run_handler_and_reply(task, dispatch_message, /*is_initialize=*/false, sid);
+  dispatch_call(/*is_init=*/false, sid);
 }
 
 // --------------------------------------------------------------------------
@@ -383,8 +468,8 @@ void StreamableHttpTransport::set_message_handler(MessageHandler handler) {
   impl_->handler = std::move(handler);
 }
 
-void StreamableHttpTransport::set_async_probe(AsyncProbe probe) {
-  impl_->async_probe = std::move(probe);
+void StreamableHttpTransport::set_dispatch_probe(DispatchProbe probe) {
+  impl_->dispatch_probe = std::move(probe);
 }
 
 int StreamableHttpTransport::run(uint16_t port) {

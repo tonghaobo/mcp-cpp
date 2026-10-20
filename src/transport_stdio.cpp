@@ -10,8 +10,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -26,6 +28,7 @@ void StdioTransport::set_message_handler(MessageHandler handler) {
 }
 
 void StdioTransport::send(const nlohmann::json& message) {
+  std::lock_guard<std::mutex> lock(mutex_);
   try {
     std::cout << message.dump() << '\n';
     std::cout.flush();
@@ -58,10 +61,15 @@ int StdioTransport::run() {
     switch (pm.kind) {
       case jsonrpc::ParsedMessage::Kind::kRequest: {
         if (handler_) {
-          const nlohmann::json reply = handler_(pm.request.to_json());
-          if (!reply.is_null()) {
+          // Replies are written as they arrive and carry their own id, so the
+          // loop keeps reading while a deferred tool is still pending.
+          auto replied = std::make_shared<std::atomic<bool>>(false);
+          handler_(pm.request.to_json(), [this, replied](nlohmann::json reply) {
+            if (reply.is_null() || replied->exchange(true)) {
+              return;  // nothing to send, or already replied
+            }
             send(reply);
-          }
+          });
         }
         break;
       }
@@ -69,7 +77,7 @@ int StdioTransport::run() {
         // Notifications never produce a reply, but must still be processed
         // (e.g. notifications/initialized updates server state).
         if (handler_) {
-          handler_(pm.notification.to_json());
+          handler_(pm.notification.to_json(), [](nlohmann::json) {});
         }
         break;
       }

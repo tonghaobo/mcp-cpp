@@ -76,7 +76,7 @@ def main() -> int:
         assert status == 200, (status, raw)
         r = json.loads(raw)["result"]
         names = {t["name"] for t in r["tools"]}
-        assert names == {"echo", "add", "slow_add", "get_time"}, names
+        assert names == {"echo", "add", "slow_add", "slow_query", "get_time"}, names
         assert r["cacheScope"] in ("private", "public"), r
         assert r["resultType"] == "complete", r
         assert r["ttlMs"] == 0, r

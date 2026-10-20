@@ -5,6 +5,8 @@
 // changes.
 #pragma once
 
+#include <mcp/dispatch.hpp>
+
 #include <nlohmann/json.hpp>
 
 #include <functional>
@@ -13,9 +15,11 @@ namespace mcp {
 
 class ITransport {
  public:
-  // Handler receives one decoded JSON-RPC message (request or notification)
-  // and returns the response JSON to send back (null json -> nothing to send).
-  using MessageHandler = std::function<nlohmann::json(const nlohmann::json&)>;
+  // Handler receives one decoded JSON-RPC message (request or notification) and
+  // calls `done` with the response to send back (null json -> nothing to send).
+  // For a request owned by a kDeferred tool, `done` may be called later and from
+  // another thread; the transport must be ready for that.
+  using MessageHandler = std::function<void(const nlohmann::json&, Done)>;
 
   virtual ~ITransport() = default;
 
