@@ -72,6 +72,10 @@ if(MCP_BUILD_EXAMPLES)
     add_executable(mcp_http_example examples/http_server.cpp)
     target_link_libraries(mcp_http_example PRIVATE mcp)
 
+    # Slow HTTP service: pure waiting, used to exercise kDeferred tools.
+    add_executable(delay_server examples/delay_server.cpp)
+    target_link_libraries(delay_server PRIVATE
+                          workflow-static nlohmann_json::nlohmann_json)
   endif()
 endif()
 

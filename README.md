@@ -41,9 +41,13 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMCP_ENABLE_WORKFLOW=ON
 cmake --build build -j"$(nproc)"
 ./build/mcp_http_example 127.0.0.1 8931   # 默认 http://127.0.0.1:8931/mcp
 ./build/mcp_http_example 0.0.0.0 8931     # 绑定所有接口，接受远程连接
+
+# 让 slow_query 走真实 HTTP（delay_server：按 delay 纯等待后回包，等待期间不占线程）
+./build/delay_server 9100 &
+./build/mcp_http_example 127.0.0.1 8931 --query-url http://127.0.0.1:9100
 ```
 
-> `mcp_http_example` 接受 `[host] [port]`：`host` 为监听地址（`127.0.0.1` 仅本机、`0.0.0.0` 对外），默认 `127.0.0.1`；`port` 默认 `8931`。
+> `mcp_http_example` 接受 `[host] [port] [--query-url URL]`：`host` 为监听地址（`127.0.0.1` 仅本机、`0.0.0.0` 对外），默认 `127.0.0.1`；`port` 默认 `8931`；`--query-url` 指定被查询的 HTTP 服务地址，不传时 `slow_query` 退回本地 timer。
 
 产物：静态库 `libmcp.a`、示例 server `build/mcp_example`（stdio）/ `build/mcp_http_example`（HTTP）、单元测试 `jsonrpc_test` / `server_test`。
 
@@ -200,11 +204,11 @@ v1 形态并发 `tools/call` `add`（相同工具、同容器、同压测客户�
 
 ```
 .
-├── CMakeLists.txt              # C++20；mcp 静态库 + mcp_example + mcp_http_example + ctest；MCP_ENABLE_WORKFLOW 开关
+├── CMakeLists.txt              # C++20；mcp 静态库 + mcp_example / mcp_http_example / delay_server + ctest；MCP_ENABLE_WORKFLOW 开关
 ├── Dockerfile                  # ubuntu:24.04 + build-essential/cmake/git/libssl-dev/python3-venv
 ├── include/mcp/                # 公共头文件（jsonrpc / protocol / tool / transport / transport_stdio / transport_http / server）
 ├── src/                        # 实现（jsonrpc / server / tool / transport_stdio / transport_http）
-├── examples/                   # echo_server.cpp（stdio）· http_server.cpp（Streamable HTTP）
+├── examples/                   # echo_server.cpp（stdio）· http_server.cpp（Streamable HTTP）· delay_server.cpp（慢 HTTP 测试服务）
 ├── tests/                      # 单元 + 集成 + SDK 互通测试
 ├── benchmark/                  # 性能基准：bench.py + fastmcp_server.py + README
 └── scripts/                    # build_docker.sh / interop.sh / benchmark.sh / benchmark_local.sh
