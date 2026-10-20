@@ -186,10 +186,11 @@ int main() {
 ## 性能基准（Benchmark）
 
 对比 mcp-cpp（C++/workflow）与官方 Python SDK（fastmcp），单端点 Streamable HTTP，
-v1 形态并发 `tools/call` `add`（相同工具、同容器、同压测客户端）。详细方法与复现见
-[benchmark/README.md](benchmark/README.md)。
+v1 形态并发 `tools/call`。负载覆盖三种执行模型——`inline`（纯计算）、`thread`（阻塞 worker）、
+`deferred`（等待不占线程）——外加 70/20/10 混合画像。下表是其中最基础的 `inline`（`add`）
+场景；三档与混合的完整数据见 [benchmark/README.md](benchmark/README.md)。
 
-**P50 延迟（ms）与 QPS**
+**`inline`（`add`）P50 延迟（ms）与 QPS**
 
 | 并发 | mcp-cpp P50 | mcp-cpp QPS | fastmcp P50 | fastmcp QPS | 延迟倍数 | QPS 倍数 |
 |---|---|---|---|---|---|---|
@@ -198,7 +199,14 @@ v1 形态并发 `tools/call` `add`（相同工具、同容器、同压测客户�
 | 1000 | 15.35 | 14275 | 330.7 | 1609 | ~21x | ~9x |
 
 > mcp-cpp 的 P50 延迟比 fastmcp 快约 **20 倍**，QPS 约 **9–11 倍**；高并发下 fastmcp 延迟急剧
-> 劣化（1000 并发 P50 331ms），mcp-cpp 仍保持 15ms。复现：`REQUESTS=2000 CONCS="100 500 1000" ./scripts/benchmark.sh`。
+> 劣化（1000 并发 P50 331ms），mcp-cpp 仍保持 15ms。
+>
+> 混合负载（70/20/10，本机 4 核冒烟）下，mcp-cpp 的 `inline` P50 仍是 14.9ms，与单独压测的
+> 13.7ms 基本一致——`deferred` 的长等待没有拖慢短任务；`deferred` 单独压测时两边 QPS 都收敛到
+> "并发 / 等待时间"，说明都不占线程。
+>
+> 复现：`REQUESTS=2000 CONCS="100 500 1000" ./scripts/benchmark.sh`（默认跑三档 + 混合；
+> 只跑基础档用 `SCENARIOS="inline"`）。
 
 ## 目录结构
 

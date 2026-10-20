@@ -71,7 +71,11 @@ json get_time_handler(const json& /*args*/) {
 // kThread: occupy a worker thread for the whole call (registered with
 // dispatch = kThread). A stand-in for a blocking SDK or CPU-bound work.
 json slow_add_handler(const json& args) {
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  const int delay_ms = args.value("delay_ms", 200);
+  if (delay_ms < 0 || delay_ms > 60000) {
+    throw std::invalid_argument("delay_ms must be 0..60000");
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
   return add_handler(args);
 }
 

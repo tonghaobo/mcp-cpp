@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Benchmark on the host, without Docker: mcp-cpp (C++/workflow) vs official
-# Python SDK (fastmcp), same `add` tool, same v1 tools/call load.
+# Python SDK (fastmcp), same three execution models, same v1 tools/call load.
 #
 # Host twin of scripts/benchmark.sh: builds build/mcp_http_example locally and
 # drives it (and the fastmcp reference server) with benchmark/bench.py at
@@ -9,6 +9,7 @@
 #
 # Usage: scripts/benchmark_local.sh
 # Env:   REQUESTS (2000) · CONCS ("100 500 1000")
+#        SCENARIOS ("inline thread deferred mixed")
 #        MCPCPP_PORT (8980) · PY_PORT (8981) · PYTHON (<repo>/.venv/bin/python)
 #
 # CAVEAT: the server and the load client share this machine's CPU. On a 4-core
@@ -22,6 +23,7 @@ MCPCPP_PORT="${MCPCPP_PORT:-8980}"
 PY_PORT="${PY_PORT:-8981}"
 REQUESTS="${REQUESTS:-2000}"
 CONCS="${CONCS:-100 500 1000}"
+SCENARIOS="${SCENARIOS:-inline thread deferred mixed}"
 
 # Interpreter for bench.py / uvicorn. Defaults to the repo venv, created on
 # demand: Ubuntu 24.04 is PEP 668 externally-managed, so a venv is mandatory.
@@ -54,14 +56,16 @@ wait_for_port() {
 }
 
 run_waves() {  # run_waves <port>
-  for C in $CONCS; do
-    echo "--- concurrency $C ---"
-    "$PYTHON" benchmark/bench.py --url "http://127.0.0.1:$1/mcp" \
-        --concurrency "$C" --requests "$REQUESTS"
+  for S in $SCENARIOS; do
+    for C in $CONCS; do
+      echo "--- scenario $S concurrency $C ---"
+      "$PYTHON" benchmark/bench.py --url "http://127.0.0.1:$1/mcp" \
+          --scenario "$S" --concurrency "$C" --requests "$REQUESTS"
+    done
   done
 }
 
-echo "==> Benchmark on host: mcp-cpp vs fastmcp (same add tool)"
+echo "==> Benchmark on host: mcp-cpp vs fastmcp (three models + mixed)"
 
 echo "### 1. Build mcp-cpp"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMCP_ENABLE_WORKFLOW=ON >/dev/null

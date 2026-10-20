@@ -10,9 +10,11 @@ MCPCPP_PORT="${MCPCPP_PORT:-8980}"
 PY_PORT="${PY_PORT:-8981}"
 REQUESTS="${REQUESTS:-2000}"
 CONCS="${CONCS:-100 500 1000}"
+SCENARIOS="${SCENARIOS:-inline thread deferred mixed}"
 
-echo "==> Benchmark in container: mcp-cpp vs fastmcp (same add tool)"
-docker run --rm -e CONCS="$CONCS" -e REQUESTS="$REQUESTS" -v "$PWD:/src" -w /src "$IMAGE" bash -c '
+echo "==> Benchmark in container: mcp-cpp vs fastmcp (three models + mixed)"
+docker run --rm -e CONCS="$CONCS" -e REQUESTS="$REQUESTS" \
+    -e SCENARIOS="$SCENARIOS" -v "$PWD:/src" -w /src "$IMAGE" bash -c '
   set -euo pipefail
 
   echo "### 1. Build mcp-cpp"
@@ -23,10 +25,12 @@ docker run --rm -e CONCS="$CONCS" -e REQUESTS="$REQUESTS" -v "$PWD:/src" -w /src
   ./build/mcp_http_example 127.0.0.1 8980 >/tmp/mcppp.log 2>&1 &
   MC=$!
   sleep 1.5
-  for C in $CONCS; do
-    echo "--- concurrency $C ---"
-    ./.venv/bin/python benchmark/bench.py --url http://127.0.0.1:8980/mcp \
-        --concurrency "$C" --requests "$REQUESTS"
+  for S in $SCENARIOS; do
+    for C in $CONCS; do
+      echo "--- scenario $S concurrency $C ---"
+      ./.venv/bin/python benchmark/bench.py --url http://127.0.0.1:8980/mcp \
+          --scenario "$S" --concurrency "$C" --requests "$REQUESTS"
+    done
   done
   kill $MC 2>/dev/null || true
 
@@ -34,10 +38,12 @@ docker run --rm -e CONCS="$CONCS" -e REQUESTS="$REQUESTS" -v "$PWD:/src" -w /src
   ./.venv/bin/uvicorn benchmark.fastmcp_server:app --host 127.0.0.1 --port 8981 >/tmp/py.log 2>&1 &
   PY=$!
   sleep 2
-  for C in $CONCS; do
-    echo "--- concurrency $C ---"
-    ./.venv/bin/python benchmark/bench.py --url http://127.0.0.1:8981/mcp \
-        --concurrency "$C" --requests "$REQUESTS"
+  for S in $SCENARIOS; do
+    for C in $CONCS; do
+      echo "--- scenario $S concurrency $C ---"
+      ./.venv/bin/python benchmark/bench.py --url http://127.0.0.1:8981/mcp \
+          --scenario "$S" --concurrency "$C" --requests "$REQUESTS"
+    done
   done
   kill $PY 2>/dev/null || true
 '
