@@ -107,11 +107,13 @@ void McpServer::handle_message(const nlohmann::json& message, Done done) {
       return;
     }
 
-    // Detect a 2026-07-28 (stateless) request. The transport routes by the
-    // MCP-Protocol-Version header; here we additionally trust the _meta
-    // envelope so the core stays correct regardless of transport.
-    bool is_v2 = (method == kMethodServerDiscover);
-    if (!is_v2 && message.contains("params") && message["params"].is_object() &&
+    // Detect a 2026-07-28 (stateless) request from the per-request envelope.
+    // HTTP transports validate the envelope and its headers before dispatch; a
+    // headerless transport (stdio) relies on _meta alone. `server/discover` is
+    // not a signal here -- it is an ordinary method whose response shape is
+    // fixed by the method itself.
+    bool is_v2 = false;
+    if (message.contains("params") && message["params"].is_object() &&
         message["params"].contains("_meta") &&
         message["params"]["_meta"].is_object()) {
       const auto& meta = message["params"]["_meta"];

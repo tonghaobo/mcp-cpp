@@ -20,6 +20,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace mcp {
 
@@ -28,6 +29,17 @@ namespace {
 // MCP Streamable HTTP header names.
 constexpr const char* kSessionHeader = "Mcp-Session-Id";
 constexpr const char* kProtocolVersionHeader = "MCP-Protocol-Version";
+constexpr const char* kMethodHeader = "Mcp-Method";
+constexpr const char* kNameHeader = "Mcp-Name";
+
+// Revisions reachable through the initialize handshake (2026-07-28 reference
+// SDK list). A version header naming anything else means the stateless
+// per-request-envelope era; missing headers stay on the v1 session path so old
+// clients keep working.
+bool is_handshake_version(const std::string& version) {
+  return version == "2024-11-05" || version == "2025-03-26" ||
+         version == "2025-06-18" || version == "2025-11-25";
+}
 
 // Mime types.
 constexpr const char* kContentTypeJson = "application/json";
@@ -88,19 +100,22 @@ struct StreamableHttpTransport::Impl
   // for kInline (process thread) and kThread (compute thread); the handler must
   // finish inside this call. Must not be called twice for the same task.
   void run_handler_and_reply(WFHttpTask* task, const nlohmann::json& message,
-                             bool is_initialize, const std::string& sid);
+                             bool is_initialize, const std::string& sid,
+                             bool is_modern);
 
   // Dispatch a tool/call to a workflow compute thread via a go task, so a
   // blocking handler holds at most one worker thread instead of a transport
   // one. The go task runs run_handler_and_reply() and writes the response there.
   void dispatch_async(WFHttpTask* task, const nlohmann::json& message,
-                      bool is_initialize, const std::string& sid);
+                      bool is_initialize, const std::string& sid,
+                      bool is_modern);
 
   // Dispatch a tool/call that answers later (kDeferred): the request is parked
   // on a counter gate, so it holds no thread while the tool waits for whatever
   // it is waiting for. The tool calls Done (from any thread) to finish it.
   void dispatch_deferred(WFHttpTask* task, const nlohmann::json& message,
-                         bool is_initialize, const std::string& sid);
+                         bool is_initialize, const std::string& sid,
+                         bool is_modern);
 
   void sweep_expired_sessions();
 };
@@ -128,6 +143,40 @@ bool get_header(HttpRequest* req, const char* name, std::string* out) {
   return false;
 }
 
+// A routing header supplied more than once: first-copy and last-copy readers
+// would disagree, so the modern wire rejects it. Reports its lowercase name
+// (mirrors the reference SDK's find_duplicated_routing_header).
+bool find_duplicated_routing_header(HttpRequest* req, std::string* out) {
+  std::vector<std::string> seen;
+  protocol::HttpHeaderCursor cursor(req);
+  std::string name, value;
+  while (cursor.next(name, value)) {
+    std::string key;
+    for (const char c : name) {
+      key += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    }
+    bool routing = false;
+    for (const char* candidate :
+         {kProtocolVersionHeader, kMethodHeader, kNameHeader}) {
+      if (strcasecmp(key.c_str(), candidate) == 0) {
+        routing = true;
+        break;
+      }
+    }
+    if (!routing) {
+      continue;
+    }
+    for (const std::string& prior : seen) {
+      if (prior == key) {
+        *out = key;
+        return true;
+      }
+    }
+    seen.push_back(key);
+  }
+  return false;
+}
+
 // Read the request body as a string. If the body was not fully parsed (returns
 // false), treat it as empty rather than reading garbage.
 std::string read_body(HttpRequest* req) {
@@ -151,16 +200,48 @@ void respond_json(HttpResponse* resp, int status, const nlohmann::json& payload)
   resp->append_output_body(body.c_str(), body.size());
 }
 
+// HTTP status the modern (2026-07-28) wire pairs with a JSON-RPC error code,
+// mirroring the reference SDK's ERROR_CODE_HTTP_STATUS table. Codes absent from
+// the table keep 200.
+int modern_error_status(int code) {
+  switch (code) {
+    case jsonrpc::kParseError:
+    case jsonrpc::kInvalidRequest:
+    case jsonrpc::kInvalidParams:
+    case kHeaderMismatch:
+    case kMissingRequiredClientCapability:
+    case kUnsupportedProtocolVersion:
+      return 400;
+    case jsonrpc::kMethodNotFound:
+      return 404;
+    default:
+      return 200;
+  }
+}
+
+// Status for a finished call's reply. Only the modern wire maps an error code to
+// a status; the session-era wire answers 200 for every error.
+int reply_status(const nlohmann::json& reply, bool is_modern) {
+  if (is_modern && reply.is_object() && reply.contains("error")) {
+    const auto& err = reply["error"];
+    if (err.is_object() && err.contains("code") &&
+        err["code"].is_number_integer()) {
+      return modern_error_status(err["code"].get<int>());
+    }
+  }
+  return 200;
+}
+
 // Write the HTTP response for one call. A null reply means the message needs no
 // answer (a notification): 202 Accepted with an empty body.
 void write_reply(WFHttpTask* task, const nlohmann::json& reply,
-                 bool is_initialize, const std::string& sid) {
+                 bool is_initialize, const std::string& sid, bool is_modern) {
   HttpResponse* resp = task->get_resp();
   if (reply.is_null()) {
     resp->set_status_code("202");
     resp->set_reason_phrase("Accepted");
   } else {
-    respond_json(resp, 200, reply);
+    respond_json(resp, reply_status(reply, is_modern), reply);
   }
   if (is_initialize) {
     // Hand the freshly assigned session back in the response header.
@@ -173,8 +254,12 @@ void write_reply(WFHttpTask* task, const nlohmann::json& reply,
 // the handler returned -- which costs no thread while waiting.
 class DeferredCall : public std::enable_shared_from_this<DeferredCall> {
  public:
-  DeferredCall(WFHttpTask* task, bool is_initialize, std::string sid)
-      : task_(task), is_initialize_(is_initialize), sid_(std::move(sid)) {}
+  DeferredCall(WFHttpTask* task, bool is_initialize, std::string sid,
+               bool is_modern)
+      : task_(task),
+        is_initialize_(is_initialize),
+        is_modern_(is_modern),
+        sid_(std::move(sid)) {}
 
   // Keep the series -- and with it the connection -- alive. Called from the
   // process callback, before the handler can possibly reply.
@@ -203,10 +288,13 @@ class DeferredCall : public std::enable_shared_from_this<DeferredCall> {
     gate_->count();  // the gate callback writes the response
   }
 
-  void finalize() { write_reply(task_, reply_, is_initialize_, sid_); }
+  void finalize() {
+    write_reply(task_, reply_, is_initialize_, sid_, is_modern_);
+  }
 
   WFHttpTask* task_;
   bool is_initialize_;
+  bool is_modern_;
   std::string sid_;
   WFCounterTask* gate_ = nullptr;
   std::mutex mutex_;
@@ -230,15 +318,16 @@ void StreamableHttpTransport::Impl::sweep_expired_sessions() {
 
 void StreamableHttpTransport::Impl::run_handler_and_reply(
     WFHttpTask* task, const nlohmann::json& message, bool is_initialize,
-    const std::string& sid) {
+    const std::string& sid, bool is_modern) {
   // The handler answers within this call, so write the response right here. A
   // completion arriving later (a tool that ignores its Dispatch) is dropped.
   auto replied = std::make_shared<std::atomic<bool>>(false);
-  Done done = [task, is_initialize, sid, replied](nlohmann::json reply) {
+  Done done = [task, is_initialize, sid, is_modern, replied](
+                  nlohmann::json reply) {
     if (replied->exchange(true)) {
       return;
     }
-    write_reply(task, reply, is_initialize, sid);
+    write_reply(task, reply, is_initialize, sid, is_modern);
   };
   if (handler) {
     handler(message, std::move(done));
@@ -249,11 +338,12 @@ void StreamableHttpTransport::Impl::run_handler_and_reply(
 
 void StreamableHttpTransport::Impl::dispatch_deferred(
     WFHttpTask* task, const nlohmann::json& message, bool is_initialize,
-    const std::string& sid) {
+    const std::string& sid, bool is_modern) {
   // Park the series first: the handler may call Done from inside this call,
   // from another thread, or much later -- all three are fine, and the response
   // is written once the gate completes.
-  auto call = std::make_shared<DeferredCall>(task, is_initialize, sid);
+  auto call =
+      std::make_shared<DeferredCall>(task, is_initialize, sid, is_modern);
   call->park(series_of(task));
   Done done = call->done_fn();
   if (handler) {
@@ -265,7 +355,7 @@ void StreamableHttpTransport::Impl::dispatch_deferred(
 
 void StreamableHttpTransport::Impl::dispatch_async(
     WFHttpTask* task, const nlohmann::json& message, bool is_initialize,
-    const std::string& sid) {
+    const std::string& sid, bool is_modern) {
   // Move the handler execution off the transport thread. The go task runs
   // run_handler_and_reply() on a workflow compute thread, then writes the
   // response there. Capture a shared_ptr<Impl> so the handler/sessions outlive
@@ -274,8 +364,9 @@ void StreamableHttpTransport::Impl::dispatch_async(
   // is written (and the HTTP task sent) only after the go task completes.
   std::shared_ptr<Impl> impl = shared_from_this();
   WFGoTask* go = WFTaskFactory::create_go_task(
-      "mcp", [impl, task, message, is_initialize, sid]() {
-        impl->run_handler_and_reply(task, message, is_initialize, sid);
+      "mcp", [impl, task, message, is_initialize, sid, is_modern]() {
+        impl->run_handler_and_reply(task, message, is_initialize, sid,
+                                    is_modern);
       });
   series_of(task)->push_back(go);
 }
@@ -320,6 +411,16 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
   }
 
   // ---- POST: one JSON-RPC message per request ----------------------------
+  // Era routing follows the reference SDK: only the MCP-Protocol-Version header
+  // decides. A missing header, or one naming a handshake-era revision, keeps the
+  // v1 session path; anything else enters the stateless modern path and must
+  // pass the per-request envelope checks below. Read before the body so even a
+  // parse failure is answered with the era's status code.
+  std::string proto_version_header;
+  const bool is_modern =
+      get_header(req, kProtocolVersionHeader, &proto_version_header) &&
+      !is_handshake_version(proto_version_header);
+
   const std::string raw = read_body(req);
   const jsonrpc::ParsedMessage pm = jsonrpc::parse(raw);
 
@@ -327,7 +428,7 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
   if (pm.kind != jsonrpc::ParsedMessage::Kind::kRequest &&
       pm.kind != jsonrpc::ParsedMessage::Kind::kNotification) {
     // Parse or invalid request: reply with the JSON-RPC error (id null / echoed).
-    respond_json(resp, 200,
+    respond_json(resp, is_modern ? modern_error_status(pm.error.code) : 200,
                  jsonrpc::make_error_response(pm.error_id, pm.error.code,
                                               pm.error.message));
     return;
@@ -341,55 +442,108 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
           ? pm.request.to_json()
           : pm.notification.to_json();
 
-  // Modern (2026-07-28) stateless requests carry MCP-Protocol-Version:
-  // 2026-07-28 and/or a _meta.protocolVersion envelope. server/discover is also
-  // inherently modern. These have no session and no initialize handshake; the
-  // transport passes the JSON-RPC method straight to the core (which now
-  // handles server/discover too). The core ignores _meta.
-  std::string proto_version_header;
-  const bool has_proto_header = get_header(req, kProtocolVersionHeader,
-                                           &proto_version_header);
   const std::string method_str =
       (pm.kind == jsonrpc::ParsedMessage::Kind::kRequest)
           ? pm.request.method
           : pm.notification.method;
-  bool is_v2 = has_proto_header &&
-               proto_version_header == kProtocolVersionModern;
-  if (!is_v2 && pm.kind == jsonrpc::ParsedMessage::Kind::kRequest &&
-      pm.request.has_params && message.contains("params") &&
-      message["params"].is_object() && message["params"].contains("_meta") &&
-      message["params"]["_meta"].is_object()) {
-    const auto& meta = message["params"]["_meta"];
-    const auto it = meta.find(kMetaProtocolVersionKey);
-    if (it != meta.end() && it->is_string() &&
-        it->get<std::string>() == kProtocolVersionModern) {
-      is_v2 = true;
+
+  // Validation ladder for modern requests (requests only; the revision leaves
+  // notification header requirements undefined). First failure wins:
+  //   1. no routing header supplied twice                          -> -32020
+  //   2. params._meta carries protocolVersion + clientCapabilities  -> -32602
+  //   3. routing headers mirror the body exactly                    -> -32020
+  //   4. the envelope names a revision this server serves           -> -32022
+  if (is_modern && pm.kind == jsonrpc::ParsedMessage::Kind::kRequest) {
+    auto reject_header = [&](const std::string& why) {
+      respond_json(resp, 400, jsonrpc::make_error_response(
+                                  message["id"], kHeaderMismatch, why));
+    };
+
+    std::string duplicated;
+    if (find_duplicated_routing_header(req, &duplicated)) {
+      reject_header(duplicated + " header appears more than once");
+      return;
     }
-  }
-  // server/discover is always a stateless (v2) request.
-  if (!is_v2 && pm.kind == jsonrpc::ParsedMessage::Kind::kRequest &&
-      pm.request.method == kMethodServerDiscover) {
-    is_v2 = true;
+
+    const nlohmann::json* meta = nullptr;
+    if (message.contains("params") && message["params"].is_object() &&
+        message["params"].contains("_meta") &&
+        message["params"]["_meta"].is_object()) {
+      meta = &message["params"]["_meta"];
+    }
+    if (meta == nullptr) {
+      respond_json(resp, 400,
+                   jsonrpc::make_error_response(
+                       message["id"], jsonrpc::kInvalidParams,
+                       "params._meta must be an object carrying the required "
+                       "\"io.modelcontextprotocol/protocolVersion\" and "
+                       "\"io.modelcontextprotocol/clientCapabilities\" keys"));
+      return;
+    }
+
+    std::string missing;
+    for (const char* key :
+         {kMetaProtocolVersionKey, kMetaClientCapabilitiesKey}) {
+      if (meta->contains(key)) {
+        continue;
+      }
+      if (!missing.empty()) {
+        missing += ", ";
+      }
+      missing += key;
+    }
+    if (!missing.empty()) {
+      respond_json(resp, 400,
+                   jsonrpc::make_error_response(
+                       message["id"], jsonrpc::kInvalidParams,
+                       "params._meta is missing the required envelope key(s): " +
+                           missing));
+      return;
+    }
+
+    const nlohmann::json& body_version = (*meta)[kMetaProtocolVersionKey];
+    if (!body_version.is_string() ||
+        body_version.get<std::string>() != proto_version_header) {
+      reject_header(
+          "MCP-Protocol-Version header does not match the request envelope's "
+          "protocol version");
+      return;
+    }
+    std::string header_method;
+    if (!get_header(req, kMethodHeader, &header_method) ||
+        header_method != method_str) {
+      reject_header("Mcp-Method header does not match the request body's method");
+      return;
+    }
+    if (method_str == kMethodToolsCall) {
+      const auto& params = message["params"];
+      if (params.contains("name") && params["name"].is_string()) {
+        std::string header_name;
+        if (!get_header(req, kNameHeader, &header_name) ||
+            header_name != params["name"].get<std::string>()) {
+          reject_header(
+              "Mcp-Name header does not match the request body's \"name\" "
+              "parameter");
+          return;
+        }
+      }
+    }
+    if (body_version.get<std::string>() != kProtocolVersionModern) {
+      respond_json(
+          resp, 400,
+          jsonrpc::make_error_response(
+              message["id"], kUnsupportedProtocolVersion,
+              "Unsupported protocol version",
+              nlohmann::json{
+                  {"supported", nlohmann::json::array({kProtocolVersionModern})},
+                  {"requested", body_version}}));
+      return;
+    }
   }
 
-  // Build the exact message to dispatch. For v2, stamp the modern protocol
-  // version into the message's _meta envelope so the transport-agnostic core
-  // can reliably detect a 2026-07-28 request (it routes off _meta, not the
-  // HTTP header). This covers requests that carry the version header but no
-  // _meta body envelope.
-  nlohmann::json dispatch_message = message;
-  if (is_v2) {
-    if (!dispatch_message.contains("params") ||
-        !dispatch_message["params"].is_object()) {
-      dispatch_message["params"] = nlohmann::json::object();
-    }
-    if (!dispatch_message["params"].contains("_meta") ||
-        !dispatch_message["params"]["_meta"].is_object()) {
-      dispatch_message["params"]["_meta"] = nlohmann::json::object();
-    }
-    dispatch_message["params"]["_meta"][kMetaProtocolVersionKey] =
-        kProtocolVersionModern;
-  }
+  // The core is transport-agnostic and detects v2 from params._meta, which the
+  // ladder above has already validated.
+  const nlohmann::json& dispatch_message = message;
 
   // Dispatch probe: only tool/call is routed by execution model. The probe is
   // cheap and runs on the process thread; session bookkeeping and protocol
@@ -408,15 +562,16 @@ void StreamableHttpTransport::Impl::on_http_request(WFHttpTask* task) {
   // answers right here on the process thread.
   auto dispatch_call = [&](bool is_init, const std::string& call_sid) {
     if (dispatch == Dispatch::kDeferred) {
-      dispatch_deferred(task, dispatch_message, is_init, call_sid);
+      dispatch_deferred(task, dispatch_message, is_init, call_sid, is_modern);
     } else if (dispatch == Dispatch::kThread) {
-      dispatch_async(task, dispatch_message, is_init, call_sid);
+      dispatch_async(task, dispatch_message, is_init, call_sid, is_modern);
     } else {
-      run_handler_and_reply(task, dispatch_message, is_init, call_sid);
+      run_handler_and_reply(task, dispatch_message, is_init, call_sid,
+                            is_modern);
     }
   };
 
-  if (is_v2) {
+  if (is_modern) {
     // Stateless: no session required, no handshake.
     dispatch_call(/*is_init=*/false, "");
     return;

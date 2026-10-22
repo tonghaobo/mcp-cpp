@@ -91,6 +91,14 @@ int query_delay(const json& args) {
   return delay;
 }
 
+// MCP two-tier errors: a tool that ran but failed reports that inside a normal
+// result (isError=true), not as a JSON-RPC error -- the model can read the text
+// and retry. Protocol errors (unknown tool, bad params) stay JSON-RPC errors.
+json tool_error(const std::string& text) {
+  return json{{"content", json::array({json{{"type", "text"}, {"text", text}}})},
+              {"isError", true}};
+}
+
 // kDeferred: reply when the HTTP service answers (create_http_task), or after
 // a local timer when no --query-url was given. No thread is held while waiting.
 void slow_query_handler(const json& args, mcp::Done done) {
@@ -118,14 +126,14 @@ void slow_query_handler(const json& args, mcp::Done done) {
         if (t->get_state() != WFT_STATE_SUCCESS || status == nullptr ||
             std::strcmp(status, "200") != 0 ||
             !t->get_resp()->get_parsed_body(&body, &len)) {
-          done(json{{"error", "upstream unavailable"}});   // 失败也必须回包
+          done(tool_error("upstream unavailable"));   // 失败也必须回包
           return;
         }
         try {
           done(json::parse(static_cast<const char*>(body),
                            static_cast<const char*>(body) + len));
         } catch (const std::exception&) {
-          done(json{{"error", "response is not JSON"}});
+          done(tool_error("response is not JSON"));
         }
       });
   task->set_receive_timeout((delay + 15) * 1000);   // ms

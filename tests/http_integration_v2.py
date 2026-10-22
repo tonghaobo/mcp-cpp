@@ -2,15 +2,21 @@
 """End-to-end v2 (2026-07-28, stateless / no session-id) HTTP integration test.
 
 Speaks raw HTTP against mcp_http_example, exercising the modern stateless path:
-requests carry MCP-Protocol-Version: 2026-07-28 and a _meta envelope but NO
-Mcp-Session-Id and no initialize handshake. Verifies:
+requests carry the per-request envelope (params._meta) plus the mirrored
+MCP-Protocol-Version / Mcp-Method / Mcp-Name headers, but NO Mcp-Session-Id and
+no initialize handshake. Verifies:
 
    1. server/discover -> 200, capabilities/cacheScope/resultType/
       supportedVersions/ttlMs (v2 shape, no session required)
    2. tools/list -> 200 with cacheScope/resultType/ttlMs (no session)
    3. tools/call add -> 200 with resultType (no session)
    4. ping -> 200 with resultType
-   5. unknown method -> 200 JSON-RPC -32601
+   5. unknown method -> 404 JSON-RPC -32601 (status table maps -32601 to 404)
+   6. unknown tool -> 200 -32005 (a code outside the status table stays 200)
+   7. missing _meta envelope -> 400 -32602
+   8. Mcp-Method header disagreeing with the body -> 400 -32020
+   9. unserved revision named by the envelope -> 400 -32022
+  10. a routing header supplied twice -> 400 -32020
 
 Usage: http_integration_v2.py <path-to-mcp_http_example> [port]
 """
@@ -23,13 +29,24 @@ import time
 
 PATH = "/mcp"
 V2 = "2026-07-28"
+META_VERSION = "io.modelcontextprotocol/protocolVersion"
+META_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
 
 
-def request(port, body, headers=None):
+def request(port, body, headers=None, version=V2, envelope=True):
+    """POST one message with the v2 envelope and mirrored routing headers."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     h = {"Accept": "application/json, text/event-stream",
          "Content-Type": "application/json",
-         "MCP-Protocol-Version": V2}
+         "MCP-Protocol-Version": version}
+    if envelope:
+        params = body.setdefault("params", {})
+        meta = params.setdefault("_meta", {})
+        meta[META_VERSION] = version
+        meta[META_CAPABILITIES] = {}
+        h["Mcp-Method"] = body["method"]
+        if isinstance(params.get("name"), str):
+            h["Mcp-Name"] = params["name"]
     if headers:
         h.update(headers)
     conn.request("POST", PATH, body=json.dumps(body), headers=h)
@@ -96,12 +113,60 @@ def main() -> int:
         assert status == 200, (status, raw)
         assert json.loads(raw)["result"] == {"resultType": "complete"}, raw
 
-        # 5. unknown method.
+        # 5. unknown method -> -32601 carries HTTP 404 on the modern wire.
         status, raw = request(port, {"jsonrpc": "2.0", "id": 5, "method": "no/such"})
-        assert status == 200, (status, raw)
+        assert status == 404, (status, raw)
         assert json.loads(raw)["error"]["code"] == -32601, raw
 
-        print("http_integration_v2: all 5 steps passed")
+        # 6. a code outside the status table (unknown tool) stays 200.
+        status, raw = request(port, {
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": {"name": "no_such_tool", "arguments": {}}})
+        assert status == 200, (status, raw)
+        assert json.loads(raw)["error"]["code"] == -32005, raw
+
+        # 7. missing _meta envelope.
+        status, raw = request(port, {"jsonrpc": "2.0", "id": 7, "method": "ping"},
+                              envelope=False)
+        assert status == 400, (status, raw)
+        assert json.loads(raw)["error"]["code"] == -32602, raw
+
+        # 8. Mcp-Method disagreeing with the body's method.
+        status, raw = request(port, {"jsonrpc": "2.0", "id": 8, "method": "ping"},
+                              headers={"Mcp-Method": "tools/list"})
+        assert status == 400, (status, raw)
+        assert json.loads(raw)["error"]["code"] == -32020, raw
+
+        # 9. envelope naming a revision this server does not serve.
+        status, raw = request(port, {"jsonrpc": "2.0", "id": 9, "method": "ping"},
+                              version="2027-01-01")
+        assert status == 400, (status, raw)
+        err = json.loads(raw)["error"]
+        assert err["code"] == -32022, raw
+        assert err["data"]["supported"] == [V2], raw
+
+        # 10. routing header supplied twice (raw putheader: dict headers cannot
+        # repeat a name).
+        payload = json.dumps({
+            "jsonrpc": "2.0", "id": 10, "method": "ping",
+            "params": {"_meta": {META_VERSION: V2, META_CAPABILITIES: {}}}})
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.putrequest("POST", PATH)
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(payload)))
+        conn.putheader("MCP-Protocol-Version", V2)
+        conn.putheader("Mcp-Method", "ping")
+        conn.putheader("Mcp-Method", "ping")
+        conn.endheaders(payload.encode())
+        resp = conn.getresponse()
+        raw = resp.read().decode()
+        conn.close()
+        assert resp.status == 400, (resp.status, raw)
+        err = json.loads(raw)["error"]
+        assert err["code"] == -32020, raw
+        assert "mcp-method" in err["message"], raw
+
+        print("http_integration_v2: all 10 steps passed")
         return 0
     except Exception as exc:  # noqa: BLE001
         proc.kill()
